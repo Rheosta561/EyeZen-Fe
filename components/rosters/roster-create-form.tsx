@@ -16,7 +16,6 @@ export function RosterCreateForm({ departments, departmentId }: { departments: D
   const canWriteRosters = hasPermission(current.data?.role, "rosters:write");
   const queryClient = useQueryClient();
   const [form, setForm] = useState({ name: "" });
-  const [error, setError] = useState<string | null>(null);
 
   const create = useMutation({
     mutationFn: async () => {
@@ -37,13 +36,14 @@ export function RosterCreateForm({ departments, departmentId }: { departments: D
     onSuccess: async () => {
       toast.success("Roster created");
       setForm({ name: "" });
-      setError(null);
       await queryClient.invalidateQueries({ queryKey: ["workspace", "rosters"] });
     },
     onError: (err) => {
       const message = err instanceof Error ? err.message : "Roster could not be created.";
-      setError(message);
-      toast.error(message);
+      const description = /failed to fetch|network|fetch failed/i.test(message)
+        ? "EyeZen could not be reached. Check the connection and try again. Your roster name is still here."
+        : message;
+      toast.error("Roster was not created", { description });
     },
   });
 
@@ -57,9 +57,8 @@ export function RosterCreateForm({ departments, departmentId }: { departments: D
   return (
     <section className="roster-create-card">
       <div><b>Create a new roster draft</b><span>Enter a name. The roster starts as a draft; add weekly templates, generate assignments, then publish.</span></div>
-      {error && <div className="form-result" role="status">{error}</div>}
-      <form className="roster-form" onSubmit={(event) => { event.preventDefault(); create.mutate(); }}>
-        <label className="form-label">Roster name<input required maxLength={ROSTER_NAME_MAX_LENGTH} value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })}/>{error && <small className="field-error">{error}</small>}</label>
+      <form className="roster-form" noValidate onSubmit={(event) => { event.preventDefault(); create.mutate(); }}>
+        <label className="form-label">Roster name<input required maxLength={ROSTER_NAME_MAX_LENGTH} value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })}/></label>
         <div className="invite-actions"><button className="button button-primary" disabled={create.isPending || !departmentId}>{create.isPending ? "Creating…" : "Create roster"}</button>{departmentId ? <span className="field-hint">Department: {departments.find((d) => d.id === departmentId)?.name}</span> : null}</div>
       </form>
     </section>

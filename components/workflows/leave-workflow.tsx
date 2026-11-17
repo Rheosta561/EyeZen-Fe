@@ -4,10 +4,11 @@ import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { apiFetch } from "@/lib/api/client";
+import { zonedDateTimeToIso } from "@/lib/datetime";
 
 type Department = { id: string; name: string; code: string };
 
-export function LeaveWorkflow({ role, departments, departmentId, requestId, onDecisionComplete }: { role: string; departments: Department[]; departmentId: string; requestId?: string; onDecisionComplete?: () => void }) {
+export function LeaveWorkflow({ role, departments, departmentId, requestId, onDecisionComplete, timeZone = "UTC" }: { role: string; departments: Department[]; departmentId: string; requestId?: string; onDecisionComplete?: () => void; timeZone?: string }) {
   const [open, setOpen] = useState(false);
   const [decision, setDecision] = useState<"APPROVED" | "REJECTED" | null>(null);
   const [reason, setReason] = useState("");
@@ -17,7 +18,7 @@ export function LeaveWorkflow({ role, departments, departmentId, requestId, onDe
     if (!form.startsAt || !form.endsAt || !form.departmentId) throw new Error("Choose a department and both dates.");
     const startsAt = new Date(form.startsAt); const endsAt = new Date(form.endsAt);
     if (Number.isNaN(startsAt.valueOf()) || Number.isNaN(endsAt.valueOf()) || startsAt >= endsAt) throw new Error("End date must be later than start date.");
-    const response = await apiFetch("/api/leave-requests", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ departmentId: form.departmentId, startsAt: startsAt.toISOString(), endsAt: endsAt.toISOString(), category: form.category.trim(), ...(form.notes.trim() ? { notes: form.notes.trim() } : {}) }) });
+    const response = await apiFetch("/api/leave-requests", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ departmentId: form.departmentId, startsAt: zonedDateTimeToIso(form.startsAt, timeZone), endsAt: zonedDateTimeToIso(form.endsAt, timeZone), category: form.category.trim(), ...(form.notes.trim() ? { notes: form.notes.trim() } : {}) }) });
     if (!response.ok) throw new Error("Leave request could not be submitted. Confirm your department access and dates.");
   }, onSuccess: async () => { toast.success("Leave request submitted"); setOpen(false); await queryClient.invalidateQueries({ queryKey: ["workspace", "leave"] }); }, onError: (error) => toast.error(error.message) });
   const decide = useMutation({ mutationFn: async () => {

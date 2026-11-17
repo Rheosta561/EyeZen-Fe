@@ -28,7 +28,7 @@ export function navigationFor(role: string | undefined): RoleNavItem[] {
   if (hasPermission(role, "rosters:write")) items.push({ label: "Replacements", href: "/replacements" });
   else if (hasPermission(role, "replacement:respond")) items.push({ label: "Replacement responses", href: "/replacements" });
   if (hasPermission(role, "appointments:read")) items.push({ label: role === "DOCTOR" ? "My appointments" : role === "RECEPTION_FRONT_DESK" ? "Appointment desk" : "Appointments", href: "/appointments" });
-  if (hasPermission(role, "rosters:read") && role !== "DOCTOR" && role !== "DEPARTMENT_HEAD") items.push({ label: "Doctor directory", href: "/doctors" });
+  if (hasPermission(role, "rosters:read") && role !== "DOCTOR") items.push({ label: "Doctor directory", href: "/doctors" });
   if (hasPermission(role, "departments:manage")) items.push({ label: "Departments", href: "/departments" });
   if (hasPermission(role, "accounts:manage")) { items.push({ label: "Accounts", href: "/accounts" }, { label: "Invite staff", href: "/invite" }); }
   if (hasPermission(role, "notifications:manage")) items.push({ label: "Notifications", href: "/notifications" });
