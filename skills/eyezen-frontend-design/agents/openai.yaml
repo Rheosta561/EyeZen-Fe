@@ -1,0 +1,4 @@
+interface:
+  display_name: "Eyezen Frontend Design"
+  short_description: "Design EyeZen's role-aware Next.js app"
+  default_prompt: "Use $eyezen-frontend-design to plan or implement an EyeZen screen."
