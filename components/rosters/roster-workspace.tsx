@@ -402,7 +402,8 @@ export function RosterWorkspace({ departments, departmentId, timeZone }: { depar
   const availabilityQuery = useQuery({
     queryKey: ["timetable", "doctor-availability", departmentId, editorDraft?.date, editorDraft?.startMinute, editorDraft?.endMinute, editorDraft?.roomId, editorDraft?.excludeOccurrenceId],
     enabled: Boolean(accessAllowed && canWrite && departmentId && editorDraft),
-    staleTime: 15_000,
+    staleTime: 0,
+    refetchOnWindowFocus: true,
     queryFn: () => {
       if (!editorDraft) throw new Error("No duty window selected.");
       return fetchDoctorAvailability({
@@ -422,6 +423,7 @@ export function RosterWorkspace({ departments, departmentId, timeZone }: { depar
     await Promise.all([
       queryClient.invalidateQueries({ queryKey: ["timetable", "occurrences"] }),
       queryClient.invalidateQueries({ queryKey: ["timetable", "activity"] }),
+      queryClient.invalidateQueries({ queryKey: ["timetable", "doctor-availability"] }),
     ]);
   };
 
@@ -461,6 +463,7 @@ export function RosterWorkspace({ departments, departmentId, timeZone }: { depar
         queryClient.invalidateQueries({ queryKey: ["timetable", "occurrences"] }),
         queryClient.invalidateQueries({ queryKey: ["timetable", "rules"] }),
         queryClient.invalidateQueries({ queryKey: ["timetable", "activity"] }),
+        queryClient.invalidateQueries({ queryKey: ["timetable", "doctor-availability"] }),
       ]);
     },
     onError: (error) => {
