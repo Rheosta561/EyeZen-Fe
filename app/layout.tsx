@@ -12,6 +12,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
     <html
       lang="en"
       className="h-full antialiased"
+      suppressHydrationWarning
     >
       <body className="min-h-full"><Providers>{children}</Providers></body>
     </html>

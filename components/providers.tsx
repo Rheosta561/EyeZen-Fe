@@ -7,5 +7,5 @@ import { Toaster } from "sonner";
 
 export function Providers({ children }: { children: React.ReactNode }) {
   const [queryClient] = useState(() => new QueryClient({ defaultOptions: { queries: { staleTime: 30_000, retry: 1, refetchOnWindowFocus: false } } }));
-  return <ThemeProvider attribute="class" defaultTheme="system" enableSystem disableTransitionOnChange><QueryClientProvider client={queryClient}>{children}<Toaster position="top-center" richColors/></QueryClientProvider></ThemeProvider>;
+  return <ThemeProvider attribute="class" defaultTheme="system" enableSystem><QueryClientProvider client={queryClient}>{children}<Toaster position="top-center" richColors/></QueryClientProvider></ThemeProvider>;
 }

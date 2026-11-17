@@ -1,9 +1,9 @@
 export type Role = "SUPER_ADMIN" | "HOSPITAL_ADMIN" | "ROSTER_MANAGER" | "DEPARTMENT_HEAD" | "DOCTOR" | "RECEPTION_FRONT_DESK";
-export type Permission = "accounts:manage" | "departments:manage" | "rosters:read" | "rosters:write" | "rosters:publish" | "leave:approve" | "appointments:read" | "appointments:write" | "profile:read:own" | "profile:write:own" | "leave:request" | "replacement:respond" | "availability:manage:own" | "notifications:manage";
+export type Permission = "accounts:manage" | "departments:manage" | "rosters:read" | "rosters:write" | "rosters:publish" | "rooms:manage" | "leave:approve" | "appointments:read" | "appointments:write" | "profile:read:own" | "profile:write:own" | "leave:request" | "replacement:respond" | "availability:manage:own" | "notifications:manage";
 
 const rolePermissions: Record<Role, ReadonlySet<Permission>> = {
-  SUPER_ADMIN: new Set(["accounts:manage", "departments:manage", "rosters:read", "rosters:write", "rosters:publish", "leave:approve", "appointments:read", "appointments:write", "profile:read:own", "profile:write:own", "leave:request", "replacement:respond", "notifications:manage"]),
-  HOSPITAL_ADMIN: new Set(["accounts:manage", "departments:manage", "rosters:read", "rosters:write", "rosters:publish", "leave:approve", "appointments:read", "appointments:write", "profile:read:own", "profile:write:own", "leave:request", "replacement:respond", "notifications:manage"]),
+  SUPER_ADMIN: new Set(["accounts:manage", "departments:manage", "rosters:read", "rosters:write", "rosters:publish", "rooms:manage", "leave:approve", "appointments:read", "appointments:write", "profile:read:own", "profile:write:own", "leave:request", "replacement:respond", "notifications:manage"]),
+  HOSPITAL_ADMIN: new Set(["accounts:manage", "departments:manage", "rosters:read", "rosters:write", "rosters:publish", "rooms:manage", "leave:approve", "appointments:read", "appointments:write", "profile:read:own", "profile:write:own", "leave:request", "replacement:respond", "notifications:manage"]),
   ROSTER_MANAGER: new Set(["rosters:read", "rosters:write", "rosters:publish", "appointments:read", "profile:read:own"]),
   DEPARTMENT_HEAD: new Set(["rosters:read", "rosters:write", "rosters:publish", "leave:approve", "appointments:read", "profile:read:own"]),
   DOCTOR: new Set(["rosters:read", "appointments:read", "profile:read:own", "profile:write:own", "leave:request", "replacement:respond", "availability:manage:own"]),
@@ -22,6 +22,7 @@ export type RoleNavItem = { label: string; href: string };
 export function navigationFor(role: string | undefined): RoleNavItem[] {
   const items: RoleNavItem[] = [{ label: "Overview", href: "/overview" }];
   if (hasPermission(role, "rosters:read") && role !== "DOCTOR") items.push({ label: "Rosters", href: "/rosters" });
+  if (hasPermission(role, "rooms:manage")) items.push({ label: "Rooms", href: "/rooms" });
   if (role === "DOCTOR" && hasPermission(role, "appointments:read")) items.push({ label: "My schedule", href: "/schedule" });
   if (hasPermission(role, "leave:approve")) items.push({ label: "Leave & cover", href: "/leave" });
   else if (hasPermission(role, "leave:request")) items.push({ label: "Leave requests", href: "/leave" });

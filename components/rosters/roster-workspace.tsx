@@ -1,294 +1,1255 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { apiFetch } from "@/lib/api/client";
-import { useCurrentUser } from "@/lib/auth/use-current-user";
+import {
+  cancelOccurrence,
+  createOccurrence,
+  fetchActivity,
+  fetchDoctorAvailability,
+  fetchOccurrences,
+  fetchRooms,
+  fetchTimetableDoctors,
+  patchOccurrence,
+  TimetableApiError,
+  updateRosterRule,
+  type CreateOccurrenceInput,
+  type DoctorAvailability,
+  type OccurrenceConflict,
+  type Room,
+  type RosterOccurrence,
+  type TimetableDoctor,
+  type UpdateRosterRuleInput,
+} from "@/lib/api/timetable";
+import { DoctorPicker, doctorConflictLabel } from "@/components/rosters/doctor-picker";
 import { hasPermission } from "@/lib/auth/permissions";
+import { useCurrentUser } from "@/lib/auth/use-current-user";
 
 type Department = { id: string; name: string; code: string };
-type Doctor = { id: string; doctorProfileId: string | null; displayName: string; specialty?: string | null };
-type AvailabilityDoctor = Doctor & { isAvailable: boolean; reasons: string[] };
-type Conflict = { code: string; level: "BLOCKING" | "OVERRIDABLE_WARNING" | "INFORMATIONAL"; assignmentId: string; message: string };
-type Assignment = { id: string; doctorId: string; startsAt: string; endsAt: string; assignmentType: "IN_PERSON" | "TELECONSULTATION"; exceptionNote?: string | null };
-type Template = { id: string; doctorId: string; dayOfWeek: number; startMinute: number; endMinute: number; assignmentType: "IN_PERSON" | "TELECONSULTATION"; effectiveFrom: string; effectiveUntil?: string | null };
-type Roster = { id: string; name: string; status: "DRAFT" | "PUBLISHED" | "SUPERSEDED"; revision: number; publishedAt?: string | null; _count?: { assignments?: number } };
-type RosterDetail = Roster & { assignments: Assignment[]; templates: Template[] };
-type ApiProblem = Error & { conflicts?: Conflict[] };
-const NO_DOCTORS: Doctor[] = [];
+type Scope = "THIS_DATE" | "THIS_AND_FUTURE";
+type View = "week" | "day";
+type FieldErrors = Record<string, string>;
+type ZonedParts = { year: string; month: string; day: string; hour: string; minute: string };
+type ZonedClock = { date: string; minute: number };
+type ActivityEvent = { id: string; createdAt: string; action: string; metadata: Record<string, unknown> };
+type PatchInput = { scope: Scope; doctorId: string; roomId: string; startMinute: number; endMinute: number; reason: string };
+type CancelInput = { scope: Scope; reason: string };
+type MutationResult = { occurrence: RosterOccurrence; generation: { created: number; updated: number; conflicts: OccurrenceConflict[] } };
+type SaveVariables =
+  | { kind: "create"; input: CreateOccurrenceInput }
+  | { kind: "edit"; occurrenceId: string; input: PatchInput }
+  | { kind: "cancel"; occurrenceId: string; input: CancelInput };
+type PanelState =
+  | { kind: "none" }
+  | { kind: "choose"; occurrenceId: string }
+  | { kind: "create"; date: string; startMinute: number; endMinute: number; doctorId: string; roomId: string; repeatUntilDate: string }
+  | { kind: "edit"; occurrenceId: string; startMinute: number; endMinute: number; doctorId: string; roomId: string; scope: Scope; reason: string }
+  | { kind: "cancel"; occurrenceId: string; scope: Scope; reason: string }
+  | { kind: "detail"; occurrenceId: string }
+  | { kind: "rule"; ruleId: string; weekday: number; startMinute: number; endMinute: number; effectiveFrom: string; effectiveUntil: string };
 
-const weekdayLabels = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
-const weekdayShort = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-const tourSteps = [
-  { title: "Start with a draft", body: "Give this schedule a clear name. Drafts stay editable until you publish them.", target: ".roster-create-form" },
-  { title: "Choose a roster", body: "Select a department roster here. Published rosters are locked; create another draft to make changes.", target: ".roster-list" },
-  { title: "Add coverage", body: "Add a one-time duty or define weekly patterns. Search doctors by name or specialty.", target: ".roster-action-grid" },
-  { title: "Generate the schedule", body: "Choose a date range to create duties from weekly patterns. Any blocking conflicts are shown before the generated duties are saved.", target: ".roster-generate-bar" },
-  { title: "Review and publish", body: "Resolve blocking conflicts. Authorized roles can publish with a warning after recording a reason.", target: ".roster-record-list" },
-];
-function zonedParts(date: Date, timeZone: string) {
-  return Object.fromEntries(new Intl.DateTimeFormat("en-GB", { timeZone, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(date).filter((part) => part.type !== "literal").map((part) => [part.type, part.value]));
-}
-const toZonedInput = (date: Date, timeZone: string) => { const parts = zonedParts(date, timeZone); return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}`; };
-function zonedInputToIso(value: string, timeZone: string) {
-  const [datePart, timePart] = value.split("T");
-  const [year, month, day] = datePart!.split("-").map(Number);
-  const [hour, minute] = timePart!.split(":").map(Number);
-  const target = Date.UTC(year!, month! - 1, day!, hour!, minute!);
-  let guess = target;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const parts = zonedParts(new Date(guess), timeZone);
-    const represented = Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day), Number(parts.hour), Number(parts.minute));
-    guess += target - represented;
-  }
-  return new Date(guess).toISOString();
-}
-const zonedDateInputToIso = (value: string, timeZone: string, end = false) => zonedInputToIso(`${value}T${end ? "23:59" : "00:00"}`, timeZone);
-const minuteLabel = (value: number) => `${String(Math.floor(value / 60)).padStart(2, "0")}:${String(value % 60).padStart(2, "0")}`;
-const fromMinuteInput = (value: string) => { const [hours, minutes] = value.split(":").map(Number); return hours * 60 + minutes; };
+const START_HOUR = 6;
+const END_HOUR = 22;
+const SLOT_MINUTES = 30;
+const START_MINUTE = START_HOUR * 60;
+const END_MINUTE = END_HOUR * 60;
+const SLOT_COUNT = ((END_HOUR - START_HOUR) * 60) / SLOT_MINUTES;
+const SLOT_HEIGHT_PX = 28;
+const SLOT_PITCH_PX = SLOT_HEIGHT_PX + 1;
+const WEEKDAY_SHORT = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const WEEKDAY_LONG = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const MONTH_SHORT = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const NO_DOCTORS: TimetableDoctor[] = [];
+const NO_ROOMS: Room[] = [];
+const NO_OCCURRENCES: RosterOccurrence[] = [];
+const NO_AVAILABILITY: DoctorAvailability[] = [];
 
-async function apiJson<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await apiFetch(path, init);
-  if (response.ok) return response.status === 204 ? undefined as T : await response.json() as T;
-  const body = await response.json().catch(() => ({})) as { error?: string; message?: string; conflicts?: Conflict[] };
-  const knownErrors: Record<string, string> = {
-    SCHEDULE_CONFLICTS: "The schedule has blocking conflicts. Review the conflict report and adjust the affected duties.",
-    ROSTER_VALIDATION_FAILED: "This roster cannot be published yet. Review the conflict report.",
-    DEPARTMENT_SCOPE_FORBIDDEN: "You do not have roster access to the selected department.",
-    DEPARTMENT_ID_REQUIRED: "Choose a department before creating a roster.",
-    DOCTOR_NOT_IN_DEPARTMENT: "That doctor is no longer an active member of this department.",
-    INVALID_WINDOW: "The duty end must be later than its start.",
-    INVALID_LOCAL_TIME: "This local time does not exist because of a daylight-saving clock change. Choose another time.",
-    INVALID_RECURRENCE_HORIZON: "Choose a valid date range within the roster generation limit.",
-    DRAFT_ROSTER_NOT_FOUND: "This roster is no longer an editable draft. Refresh the roster list.",
-    ROSTER_UPDATE_SOURCE_CHANGED: "This roster was already replaced. Refresh and create a draft from the current publication.",
-    GENERATED_DUTIES_HAVE_REPLACEMENT_HISTORY: "These generated duties have replacement history and cannot be regenerated safely.",
+function pad2(value: number): string {
+  return String(value).padStart(2, "0");
+}
+
+function minuteLabel(value: number): string {
+  const safe = Math.max(0, Math.min(1439, Math.floor(value)));
+  return `${pad2(Math.floor(safe / 60))}:${pad2(safe % 60)}`;
+}
+
+function parseTimeInput(value: string): number | null {
+  const match = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(value);
+  if (!match) return null;
+  return Number(match[1]) * 60 + Number(match[2]);
+}
+
+function parseLocalDate(value: string): Date | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  date.setUTCFullYear(year);
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) return null;
+  return date;
+}
+
+function formatLocalDate(date: Date): string {
+  return `${String(date.getUTCFullYear()).padStart(4, "0")}-${pad2(date.getUTCMonth() + 1)}-${pad2(date.getUTCDate())}`;
+}
+
+function browserToday(): string {
+  const now = new Date();
+  return `${String(now.getFullYear()).padStart(4, "0")}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())}`;
+}
+
+function addDays(value: string, amount: number): string {
+  const date = parseLocalDate(value);
+  if (!date) return value;
+  date.setUTCDate(date.getUTCDate() + amount);
+  return formatLocalDate(date);
+}
+
+function mondayOf(value: string): string {
+  const date = parseLocalDate(value);
+  if (!date) return value;
+  date.setUTCDate(date.getUTCDate() - ((date.getUTCDay() + 6) % 7));
+  return formatLocalDate(date);
+}
+
+function isPastDate(value: string, today: string): boolean {
+  const date = parseLocalDate(value);
+  return date !== null && formatLocalDate(date) < today;
+}
+
+function dateMeta(value: string): { weekday: string; month: string; day: number; year: number } {
+  const date = parseLocalDate(value);
+  if (!date) return { weekday: "—", month: "—", day: 0, year: 0 };
+  return {
+    weekday: WEEKDAY_SHORT[date.getUTCDay()] ?? "—",
+    month: MONTH_SHORT[date.getUTCMonth()] ?? "—",
+    day: date.getUTCDate(),
+    year: date.getUTCFullYear(),
   };
-  const problem = new Error(body.message ?? knownErrors[body.error ?? ""] ?? body.error ?? `Request failed (${response.status}).`) as ApiProblem;
-  problem.conflicts = body.conflicts;
-  throw problem;
 }
 
-function dateLabel(value: string, timeZone: string) {
+function readableDate(value: string): string {
+  const meta = dateMeta(value);
+  return `${meta.weekday} ${meta.month} ${meta.day}, ${meta.year}`;
+}
+
+function rangeLabel(from: string, through: string): string {
+  const start = dateMeta(from);
+  const end = dateMeta(through);
+  if (from === through) return `${start.month} ${start.day}, ${start.year}`;
+  if (start.year === end.year && start.month === end.month) return `${start.month} ${start.day}–${end.day}, ${end.year}`;
+  if (start.year === end.year) return `${start.month} ${start.day} – ${end.month} ${end.day}, ${end.year}`;
+  return `${start.month} ${start.day}, ${start.year} – ${end.month} ${end.day}, ${end.year}`;
+}
+
+function buildRange(view: View, anchor: string): { from: string; through: string; dates: string[] } {
+  const validAnchor = parseLocalDate(anchor) ? anchor : browserToday();
+  if (view === "day") return { from: validAnchor, through: validAnchor, dates: [validAnchor] };
+  const from = mondayOf(validAnchor);
+  return {
+    from,
+    through: addDays(from, 6),
+    dates: Array.from({ length: 7 }, (_, index) => addDays(from, index)),
+  };
+}
+
+function zonedPartsFromDate(value: Date, timeZone: string): ZonedParts {
+  try {
+    const parts = new Intl.DateTimeFormat("en-GB", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+    }).formatToParts(value);
+    const map = new Map<string, string>();
+    for (const part of parts) {
+      if (part.type !== "literal") map.set(part.type, part.value);
+    }
+    return {
+      year: map.get("year") ?? "",
+      month: map.get("month") ?? "",
+      day: map.get("day") ?? "",
+      hour: map.get("hour") ?? "",
+      minute: map.get("minute") ?? "",
+    };
+  } catch {
+    return {
+      year: String(value.getUTCFullYear()).padStart(4, "0"),
+      month: pad2(value.getUTCMonth() + 1),
+      day: pad2(value.getUTCDate()),
+      hour: pad2(value.getUTCHours()),
+      minute: pad2(value.getUTCMinutes()),
+    };
+  }
+}
+
+function zonedDateTime(value: string, timeZone: string): ZonedClock | null {
   const date = new Date(value);
-  return Number.isNaN(date.valueOf()) ? value : new Intl.DateTimeFormat("en-IN", { dateStyle: "medium", timeStyle: "short", timeZone }).format(date);
+  if (Number.isNaN(date.valueOf())) return null;
+  const parts = zonedPartsFromDate(date, timeZone);
+  if (!parts.year || !parts.month || !parts.day || !parts.hour || !parts.minute) return null;
+  return {
+    date: `${parts.year}-${parts.month}-${parts.day}`,
+    minute: Number(parts.hour) * 60 + Number(parts.minute),
+  };
+}
+
+function occurrenceMinute(value: string, timeZone: string): number | null {
+  return zonedDateTime(value, timeZone)?.minute ?? null;
+}
+
+function currentZonedClock(timeZone: string): ZonedClock {
+  const parts = zonedPartsFromDate(new Date(), timeZone);
+  return {
+    date: `${parts.year}-${parts.month}-${parts.day}`,
+    minute: Number(parts.hour) * 60 + Number(parts.minute),
+  };
+}
+
+function occurrenceIsPast(occurrence: RosterOccurrence, timeZone: string, clock: ZonedClock): boolean {
+  const end = zonedDateTime(occurrence.endsAt, timeZone);
+  if (!end) return occurrence.occurrenceDate < clock.date;
+  if (end.date < clock.date) return true;
+  if (end.date > clock.date) return false;
+  return end.minute <= clock.minute;
+}
+
+function occurrenceStartsFuture(occurrence: RosterOccurrence, timeZone: string, clock: ZonedClock): boolean {
+  const start = zonedDateTime(occurrence.startsAt, timeZone);
+  if (!start) return false;
+  if (start.date > clock.date) return true;
+  if (start.date < clock.date) return false;
+  return start.minute > clock.minute;
+}
+
+function formatActivityTime(value: string, timeZone: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.valueOf())) return value;
+  try {
+    return new Intl.DateTimeFormat("en-GB", { timeZone, dateStyle: "medium", timeStyle: "short" }).format(date);
+  } catch {
+    return value;
+  }
+}
+
+function statusText(status: RosterOccurrence["status"]): string {
+  if (status === "CANCELLED") return "Cancelled";
+  if (status === "SUPERSEDED") return "Superseded";
+  return "Scheduled";
+}
+
+function conflictSummary(conflicts: OccurrenceConflict[]): string {
+  if (!conflicts.length) return "";
+  return conflicts.map((conflict) => conflict.code.replaceAll("_", " ")).join(", ");
+}
+
+function doctorLabel(occurrence: RosterOccurrence, doctorsById: Map<string, TimetableDoctor>): string {
+  return occurrence.doctor?.displayName || doctorsById.get(occurrence.doctorId)?.displayName || `Doctor ${occurrence.doctorId.slice(0, 8)}`;
+}
+
+function roomDescription(occurrence: RosterOccurrence, roomsById: Map<string, Room>): string {
+  const room = occurrence.room ?? roomsById.get(occurrence.roomId);
+  if (!room) return `Room ${occurrence.roomId.slice(0, 8)}`;
+  return [room.roomNumber, room.roomType, room.floor ? `Floor ${room.floor}` : ""].filter(Boolean).join(" · ");
+}
+
+function metadataValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") return String(value);
+  if (value && typeof value === "object") {
+    try {
+      return JSON.stringify(value) ?? "";
+    } catch {
+      return "[unavailable]";
+    }
+  }
+  return "";
+}
+
+function metadataSummary(metadata: Record<string, unknown>): string {
+  const entries = Object.entries(metadata)
+    .map(([key, value]) => ({ key, text: metadataValue(value) }))
+    .filter((entry) => entry.text.length > 0);
+  if (!entries.length) return "No additional details";
+  return entries.slice(0, 4).map((entry) => `${entry.key}: ${entry.text}`).join(" · ");
+}
+
+function actionText(action: string): string {
+  return action.replaceAll("_", " ").replaceAll("-", " ");
 }
 
 export function RosterWorkspace({ departments, departmentId, timeZone }: { departments: Department[]; departmentId: string; timeZone: string }) {
   const current = useCurrentUser();
-  const role = current.data?.role;
-  const canWrite = hasPermission(role, "rosters:write");
-  const canPublish = hasPermission(role, "rosters:publish");
-  const canOverride = ["SUPER_ADMIN", "HOSPITAL_ADMIN", "DEPARTMENT_HEAD"].includes(role ?? "");
   const queryClient = useQueryClient();
-  const [selectedId, setSelectedId] = useState("");
-  const [rosterName, setRosterName] = useState("");
-  const [activeTab, setActiveTab] = useState<"assignments" | "templates" | "revisions">("assignments");
-  const [conflicts, setConflicts] = useState<Conflict[]>([]);
-  const [overrideReason, setOverrideReason] = useState("");
-  const [form, setForm] = useState({ doctorId: "", startsAt: "", endsAt: "", assignmentType: "IN_PERSON" as Assignment["assignmentType"], exceptionNote: "" });
-  const [template, setTemplate] = useState({ doctorId: "", dayOfWeek: "1", startTime: "09:00", endTime: "17:00", assignmentType: "IN_PERSON" as Assignment["assignmentType"], effectiveFrom: "", effectiveUntil: "" });
-  const [doctorSearch, setDoctorSearch] = useState("");
-  const [templateDoctorSearch, setTemplateDoctorSearch] = useState("");
-  const [tourStep, setTourStep] = useState<number | null>(null);
-  const [generation, setGeneration] = useState({ from: "", through: "" });
-  const [editing, setEditing] = useState<Assignment | null>(null);
-  const [editingTemplate, setEditingTemplate] = useState<Template | null>(null);
-  const [rosterNameEdit, setRosterNameEdit] = useState("");
-  const [editingRosterName, setEditingRosterName] = useState(false);
+  const role = current.data?.role;
+  const accessAllowed = Boolean(role && hasPermission(role, "rosters:read") && role !== "DOCTOR");
+  const canWrite = hasPermission(role, "rosters:write");
 
-  const listQuery = useQuery({
-    queryKey: ["workspace", "rosters", departmentId], enabled: Boolean(departmentId),
-    queryFn: () => apiJson<{ items: Roster[]; total: number }>(`/api/departments/${encodeURIComponent(departmentId)}/rosters?page=1&pageSize=100`),
+  const [view, setView] = useState<View>("week");
+  const [anchor, setAnchor] = useState(browserToday);
+  const [doctorFilter, setDoctorFilter] = useState("");
+  const [roomFilter, setRoomFilter] = useState("");
+  const [panel, setPanel] = useState<PanelState>({ kind: "none" });
+  const [errors, setErrors] = useState<FieldErrors>({});
+  const [serverConflicts, setServerConflicts] = useState<OccurrenceConflict[]>([]);
+  const dialogRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (panel.kind === "none") return;
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    dialogRef.current?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setPanel({ kind: "none" });
+        setErrors({});
+        setServerConflicts([]);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      previousFocus?.focus();
+    };
+  }, [panel.kind]);
+
+  const range = useMemo(() => buildRange(view, anchor), [view, anchor]);
+  const gridStyle = {
+    "--tt-days": range.dates.length,
+    "--tt-start-hour": START_HOUR,
+    "--tt-hours": END_HOUR - START_HOUR,
+    "--tt-slot-minutes": SLOT_MINUTES,
+  } as CSSProperties;
+
+  const doctorsQuery = useQuery({
+    queryKey: ["timetable", "doctors", departmentId],
+    enabled: accessAllowed && Boolean(departmentId),
+    queryFn: () => fetchTimetableDoctors(departmentId),
   });
-  const doctorQuery = useQuery({
-    queryKey: ["roster-doctors", departmentId], enabled: Boolean(departmentId),
-    queryFn: async () => (await apiJson<{ doctors: Doctor[] }>(`/auth/departments/${encodeURIComponent(departmentId)}/doctors`)).doctors,
+  const roomsQuery = useQuery({
+    queryKey: ["timetable", "rooms", departmentId],
+    enabled: accessAllowed && Boolean(departmentId),
+    queryFn: () => fetchRooms(departmentId),
   });
-  const detailQuery = useQuery({
-    queryKey: ["roster-detail", departmentId, selectedId], enabled: Boolean(departmentId && selectedId),
-    queryFn: () => apiJson<RosterDetail>(`/api/departments/${encodeURIComponent(departmentId)}/rosters/${encodeURIComponent(selectedId)}`),
+  const occurrencesQuery = useQuery({
+    queryKey: ["timetable", "occurrences", departmentId, range.from, range.through, doctorFilter, roomFilter],
+    enabled: accessAllowed && Boolean(departmentId),
+    queryFn: () => fetchOccurrences({
+      departmentId,
+      from: range.from,
+      through: range.through,
+      doctorId: doctorFilter || undefined,
+      roomId: roomFilter || undefined,
+    }),
   });
-  let availabilityRange: { startsAt: string; endsAt: string } | null = null;
-  try {
-    if (form.startsAt && form.endsAt) {
-      const startsAt = zonedInputToIso(form.startsAt, timeZone);
-      const endsAt = zonedInputToIso(form.endsAt, timeZone);
-      if (new Date(startsAt) < new Date(endsAt)) availabilityRange = { startsAt, endsAt };
+  const activityQuery = useQuery({
+    queryKey: ["timetable", "activity", departmentId],
+    enabled: accessAllowed && Boolean(departmentId),
+    queryFn: () => fetchActivity(departmentId),
+  });
+
+  const doctors = doctorsQuery.data ?? NO_DOCTORS;
+  const rooms = roomsQuery.data ?? NO_ROOMS;
+  const doctorsById = useMemo(() => new Map(doctors.map((doctor) => [doctor.id, doctor])), [doctors]);
+  const roomsById = useMemo(() => new Map(rooms.map((room) => [room.id, room])), [rooms]);
+  const occurrences = useMemo(() => {
+    const allowed = new Set(range.dates);
+    return (occurrencesQuery.data ?? NO_OCCURRENCES)
+      .filter((occurrence) => allowed.has(occurrence.occurrenceDate))
+      .slice()
+      .sort((a, b) => a.occurrenceDate.localeCompare(b.occurrenceDate) || a.startsAt.localeCompare(b.startsAt));
+  }, [occurrencesQuery.data, range.dates]);
+  const eventsByDate = useMemo(() => {
+    const map = new Map<string, RosterOccurrence[]>();
+    for (const date of range.dates) map.set(date, []);
+    for (const occurrence of occurrences) {
+      const bucket = map.get(occurrence.occurrenceDate);
+      if (bucket) bucket.push(occurrence);
     }
-  } catch { availabilityRange = null; }
-  const dutyAvailabilityQuery = useQuery({
-    queryKey: ["roster-doctor-availability", departmentId, selectedId, availabilityRange?.startsAt, availabilityRange?.endsAt, editing?.id],
-    enabled: Boolean(canWrite && departmentId && selectedId && detailQuery.data?.status === "DRAFT" && availabilityRange),
+    return map;
+  }, [occurrences, range.dates]);
+  const activity = useMemo(() => {
+    return (activityQuery.data ?? [])
+      .slice()
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .slice(0, 12);
+  }, [activityQuery.data]);
+
+  const selectedDepartment = departments.find((department) => department.id === departmentId);
+  const clock = currentZonedClock(timeZone);
+  const today = browserToday();
+  const scheduledCount = occurrences.filter((occurrence) => occurrence.status === "SCHEDULED").length;
+  const conflictCount = occurrences.reduce((total, occurrence) => total + (occurrence.conflicts?.length ?? 0), 0);
+  const blockingCount = occurrences.reduce(
+    (total, occurrence) => total + (occurrence.conflicts ?? []).filter((conflict) => conflict.level === "BLOCKING").length,
+    0,
+  );
+  const failedQueries = [doctorsQuery, roomsQuery, occurrencesQuery, activityQuery].filter((query) => query.isError);
+
+  const panelOccurrence = panel.kind === "choose" || panel.kind === "edit" || panel.kind === "cancel" || panel.kind === "detail"
+    ? occurrences.find((occurrence) => occurrence.id === panel.occurrenceId) ?? null
+    : null;
+  const editorDraft = panel.kind === "create"
+    ? { date: panel.date, startMinute: panel.startMinute, endMinute: panel.endMinute, roomId: panel.roomId, excludeOccurrenceId: undefined }
+    : panel.kind === "edit" && panelOccurrence
+      ? { date: panelOccurrence.occurrenceDate, startMinute: panel.startMinute, endMinute: panel.endMinute, roomId: panel.roomId, excludeOccurrenceId: panel.occurrenceId }
+      : null;
+  const availabilityQuery = useQuery({
+    queryKey: ["timetable", "doctor-availability", departmentId, editorDraft?.date, editorDraft?.startMinute, editorDraft?.endMinute, editorDraft?.roomId, editorDraft?.excludeOccurrenceId],
+    enabled: Boolean(accessAllowed && canWrite && departmentId && editorDraft),
+    staleTime: 15_000,
     queryFn: () => {
-      const params = new URLSearchParams({ startsAt: availabilityRange!.startsAt, endsAt: availabilityRange!.endsAt });
-      if (editing?.id) params.set("excludeAssignmentId", editing.id);
-      return apiJson<{ doctors: AvailabilityDoctor[] }>(`/api/departments/${encodeURIComponent(departmentId)}/rosters/${encodeURIComponent(selectedId)}/available-doctors?${params.toString()}`);
+      if (!editorDraft) throw new Error("No duty window selected.");
+      return fetchDoctorAvailability({
+        departmentId,
+        occurrenceDate: editorDraft.date,
+        startMinute: editorDraft.startMinute,
+        endMinute: editorDraft.endMinute,
+        roomId: editorDraft.roomId || undefined,
+        excludeOccurrenceId: editorDraft.excludeOccurrenceId,
+      });
     },
   });
-  const revisionQuery = useQuery({
-    queryKey: ["roster-revisions", departmentId, selectedId], enabled: Boolean(departmentId && selectedId && activeTab === "revisions"),
-    queryFn: () => apiJson<Array<{ id: string; revision: number; publishedAt: string; snapshot: unknown }>>(`/api/departments/${encodeURIComponent(departmentId)}/rosters/${encodeURIComponent(selectedId)}/revisions`),
-  });
+  const doctorAvailability = availabilityQuery.data ?? NO_AVAILABILITY;
+  const doctorAvailabilityById = useMemo(() => new Map(doctorAvailability.map((item) => [item.id, item])), [doctorAvailability]);
 
-  const invalidate = async () => {
+  const invalidateTimetable = async () => {
     await Promise.all([
-      queryClient.invalidateQueries({ queryKey: ["workspace", "rosters", departmentId] }),
-      queryClient.invalidateQueries({ queryKey: ["roster-detail", departmentId, selectedId] }),
-      queryClient.invalidateQueries({ queryKey: ["roster-revisions", departmentId, selectedId] }),
+      queryClient.invalidateQueries({ queryKey: ["timetable", "occurrences"] }),
+      queryClient.invalidateQueries({ queryKey: ["timetable", "activity"] }),
     ]);
   };
-  const runMutation = useMutation({
-    mutationFn: async ({ path, method = "POST", body }: { path: string; method?: string; body?: unknown }) => apiJson<unknown>(path, {
-      method,
-      ...(body === undefined ? {} : { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
-    }),
-    onSuccess: async (data, variables) => {
-      const result = data && typeof data === "object" ? data as { conflicts?: Conflict[]; generated?: number; published?: boolean; preservedManual?: number; assignments?: Assignment[] } : {};
-      const rosterItemPath = /\/rosters\/[^/]+$/.test(variables.path);
-      setConflicts(result.conflicts ?? []);
-      setEditing(null);
-      setForm({ doctorId: "", startsAt: "", endsAt: "", assignmentType: "IN_PERSON", exceptionNote: "" });
-      setDoctorSearch("");
-      setTemplateDoctorSearch("");
-      if (variables.path.endsWith("/publish")) toast.success("Roster published as an immutable revision");
-      else if (variables.path.endsWith("/update-draft")) { const roster = data as Roster; setSelectedId(roster.id); setActiveTab("assignments"); toast.success("Update draft created", { description: "Copied duties and weekly patterns. Edit or remove duties, then publish the update." }); }
-      else if (variables.path.includes("/templates/") && variables.method === "PATCH") { toast.success("Weekly pattern updated"); setEditingTemplate(null); setTemplate({ doctorId: "", dayOfWeek: "1", startTime: "09:00", endTime: "17:00", assignmentType: "IN_PERSON", effectiveFrom: "", effectiveUntil: "" }); }
-      else if (variables.path.includes("/templates/") && variables.method === "DELETE") toast.success("Weekly pattern deleted");
-      else if (rosterItemPath && variables.method === "PATCH") { toast.success("Draft roster renamed"); setEditingRosterName(false); }
-      else if (rosterItemPath && variables.method === "DELETE") { toast.success("Draft roster deleted"); setSelectedId(""); setEditingRosterName(false); }
-      else if (variables.path.endsWith("/generate")) toast.success(`${result.generated ?? 0} pattern duties generated; ${result.preservedManual ?? 0} manual duties preserved.`);
-      else if (variables.method === "DELETE") toast.success("Draft duty deleted");
-      else toast.success(variables.method === "PATCH" ? "Draft duty updated" : "Roster change saved");
-      await invalidate();
+
+  const mutation = useMutation({
+    mutationFn: async (variables: SaveVariables): Promise<MutationResult> => {
+      if (!departmentId) throw new TimetableApiError("Select a department before saving.", 400, "DEPARTMENT_ID_REQUIRED");
+      if (variables.kind === "create") return createOccurrence(departmentId, variables.input);
+      if (variables.kind === "edit") return patchOccurrence(departmentId, variables.occurrenceId, variables.input);
+      return cancelOccurrence(departmentId, variables.occurrenceId, variables.input);
     },
-    onMutate: () => setConflicts([]),
-    onError: (error: ApiProblem) => { if (error.conflicts) setConflicts(error.conflicts); toast.error(error.message); },
-  });
-  const createRoster = useMutation({
-    mutationFn: async () => {
-      const name = rosterName.trim();
-      if (!name) throw new Error("Enter a roster name before creating the draft.");
-      if (name.length > 120) throw new Error("Roster names can be up to 120 characters.");
-      if (!departmentId) throw new Error("Choose a department before creating the draft.");
-      return apiJson<Roster>(`/api/departments/${encodeURIComponent(departmentId)}/rosters`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) });
+    onMutate: () => {
+      setErrors({});
+      setServerConflicts([]);
     },
-    onSuccess: async (roster) => { setRosterName(""); setSelectedId(roster.id); setActiveTab("assignments"); setConflicts([]); setDoctorSearch(""); setTemplateDoctorSearch(""); toast.success("Draft roster created", { description: "Add duties or weekly patterns, review conflicts, then publish when ready." }); await invalidate(); },
+    onSuccess: async (result) => {
+      const warnings = result.generation.conflicts.length;
+      toast.success(warnings ? `Saved with ${warnings} conflict warning${warnings === 1 ? "" : "s"}.` : "Timetable updated");
+      setPanel({ kind: "none" });
+      await invalidateTimetable();
+    },
     onError: (error) => {
-      const message = error instanceof Error ? error.message : "Roster could not be created.";
-      const description = /failed to fetch|network|fetch failed/i.test(message)
-        ? "EyeZen could not be reached. Check the connection and try again. Your draft name is still here."
-        : message;
-      toast.error("Draft roster was not created", { description });
+      if (error instanceof TimetableApiError) setServerConflicts(error.conflicts);
+      toast.error(error instanceof Error ? error.message : "The timetable change could not be saved.");
     },
   });
-  const saveRosterName = () => {
-    const name = rosterNameEdit.trim();
-    if (!name) { toast.error("Enter a roster name."); return; }
-    runMutation.mutate({ path: `/api/departments/${encodeURIComponent(departmentId)}/rosters/${encodeURIComponent(selectedId)}`, method: "PATCH", body: { name } });
-  };
-  const deleteRoster = () => {
-    if (!selected || selected.status !== "DRAFT") return;
-    if (window.confirm(`Delete draft “${selected.name}” and all its duties and weekly patterns? This cannot be undone.`)) {
-      runMutation.mutate({ path: `/api/departments/${encodeURIComponent(departmentId)}/rosters/${encodeURIComponent(selectedId)}`, method: "DELETE" });
-    }
-  };
 
-  const selected = detailQuery.data;
-  const doctors = doctorQuery.data ?? NO_DOCTORS;
-  const doctorName = useMemo(() => new Map(doctors.flatMap((doctor) => doctor.doctorProfileId ? [[doctor.doctorProfileId, doctor.displayName] as const] : [])), [doctors]);
-  const isDraft = selected?.status === "DRAFT";
-  const blockingCount = conflicts.filter((conflict) => conflict.level === "BLOCKING").length;
-  const warningCount = conflicts.filter((conflict) => conflict.level === "OVERRIDABLE_WARNING").length;
-  const selectedDepartment = departments.find((department) => department.id === departmentId);
-  const changeTourStep = (step: number | null) => {
-    if (step !== null && step >= 2) setActiveTab("assignments");
-    setTourStep(step);
-  };
-
-  useEffect(() => {
-    if (tourStep === null) return;
-    const step = tourSteps[tourStep];
-    let target = document.querySelector<HTMLElement>(step.target);
-    if (!target && tourStep >= 2) target = document.querySelector<HTMLElement>(".roster-editor-panel");
-    if (!target && tourStep === 1) target = document.querySelector<HTMLElement>(".roster-side-panel");
-    target?.scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "center" });
-    target?.classList.add("roster-tour-highlight");
-    return () => target?.classList.remove("roster-tour-highlight");
-  }, [tourStep, selectedId, selected?.status]);
-
-  if (current.isPending) return <div className="roster-state">Checking roster permissions…</div>;
-  if (!hasPermission(role, "rosters:read") || role === "DOCTOR") return <div className="roster-state">Department rosters are managed by roster staff. Your own published duties are available in My schedule.</div>;
-
-  return <div className="roster-workspace">
-    {!departmentId ? <div className="roster-state">Select a department to work with its rosters.</div> : <>
-      <section className="roster-overview-card">
-        <div className="roster-overview-copy"><div className="roster-overview-topline"><span className="roster-kicker">{selectedDepartment?.code ?? "DEPARTMENT"} · ROSTER STUDIO</span>{canWrite && <button className="roster-tour-launch" onClick={() => changeTourStep(0)}>Show me around <span aria-hidden="true">↗</span></button>}</div><h2>Build a safe, publishable schedule</h2><p>Create a draft, add recurring coverage or individual duties, review conflicts, then publish a revision.</p></div>
-        <div className="roster-stat"><b>{listQuery.data?.total ?? "—"}</b><span>rosters</span></div>
-        <div className="roster-stat"><b>{listQuery.data?.items.filter((item) => item.status === "DRAFT").length ?? "—"}</b><span>drafts</span></div>
-      </section>
-      <div className="roster-columns">
-        <aside className="roster-side-panel">
-          <div className="roster-panel-heading"><div><h2>Department rosters</h2><p>Choose a draft to edit or review a publication.</p></div><button className="roster-icon-button" onClick={() => void listQuery.refetch()} aria-label="Refresh roster list">↻</button></div>
-          {canWrite && <form className="roster-create-form" noValidate onSubmit={(event) => { event.preventDefault(); createRoster.mutate(); }}><label>New roster draft<input required maxLength={120} aria-label="New roster draft name" value={rosterName} onChange={(event) => setRosterName(event.target.value)} placeholder="e.g. Winter clinic coverage" /></label><button className="button button-primary" disabled={createRoster.isPending || !departmentId}>{createRoster.isPending ? "Creating…" : "Create draft"}</button></form>}
-      {listQuery.isPending ? <div className="roster-list-state">Loading rosters…</div> : listQuery.isError ? <div className="roster-list-state roster-inline-error">{listQuery.error.message}<button onClick={() => void listQuery.refetch()}>Retry</button></div> : listQuery.data?.items.length ? <div className="roster-list">{listQuery.data.items.map((roster) => <button key={roster.id} className={`roster-list-item ${selectedId === roster.id ? "selected" : ""}`} onClick={() => { setSelectedId(roster.id); setConflicts([]); setActiveTab("assignments"); }}><span className={`roster-status ${roster.status.toLowerCase()}`}>{roster.status === "DRAFT" ? "Draft" : roster.status === "SUPERSEDED" ? "Superseded" : `Published · r${roster.revision}`}</span><b>{roster.name}</b><small>{roster._count?.assignments ?? 0} assignments{roster.publishedAt ? ` · ${dateLabel(roster.publishedAt, timeZone)}` : ""}</small></button>)}</div> : <div className="roster-list-state">No rosters yet. Create the first draft above.</div>}
-        </aside>
-
-        <main className="roster-editor-panel">
-          {!selectedId ? <div className="roster-editor-empty"><span className="roster-empty-icon">▦</span><h2>Select a roster</h2><p>Choose a roster from this department, or create a draft to start planning.</p></div> : detailQuery.isPending ? <div className="roster-list-state">Loading roster detail…</div> : detailQuery.isError ? <div className="roster-list-state roster-inline-error">{detailQuery.error.message}<button onClick={() => void detailQuery.refetch()}>Retry</button></div> : selected ? <>
-            <div className="roster-editor-heading"><div><span className="roster-kicker">{selected.status === "DRAFT" ? "EDITABLE DRAFT" : selected.status === "SUPERSEDED" ? "ARCHIVED PUBLICATION" : `PUBLISHED REVISION ${selected.revision}`}</span>{editingRosterName && isDraft && canWrite ? <div className="roster-name-edit"><input aria-label="Roster name" maxLength={120} value={rosterNameEdit} onChange={(event) => setRosterNameEdit(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); saveRosterName(); } if (event.key === "Escape") setEditingRosterName(false); }}/><button className="button button-secondary compact" onClick={saveRosterName} disabled={runMutation.isPending}>Save name</button><button className="roster-row-action" onClick={() => setEditingRosterName(false)}>Cancel</button></div> : <h2>{selected.name}</h2>}<p>{selectedDepartment?.name} · {selected.assignments.length} duties · {selected.templates.length} weekly patterns</p></div><div className="roster-heading-actions">{isDraft && canWrite && !editingRosterName && <><button className="button button-secondary compact" onClick={() => { setRosterNameEdit(selected.name); setEditingRosterName(true); }}>Rename</button><button className="button button-danger compact" onClick={deleteRoster} disabled={runMutation.isPending}>Delete draft</button></>}{selected.status === "PUBLISHED" && canWrite && <button className="button button-primary compact" onClick={() => runMutation.mutate({ path: `/api/departments/${encodeURIComponent(departmentId)}/rosters/${encodeURIComponent(selectedId)}/update-draft`, body: { name: `${selected.name} · update` } })} disabled={runMutation.isPending}>Create update draft</button>}<span className={`roster-status large ${selected.status.toLowerCase()}`}>{selected.status}</span></div></div>
-            <nav className="roster-tabs" aria-label="Roster sections">{(["assignments", "templates", "revisions"] as const).map((tab) => <button key={tab} className={activeTab === tab ? "active" : ""} onClick={() => setActiveTab(tab)}>{tab === "assignments" ? `Duties (${selected.assignments.length})` : tab === "templates" ? `Weekly patterns (${selected.templates.length})` : "Revision history"}</button>)}</nav>
-
-            {conflicts.length > 0 && <section className="conflict-panel" aria-live="polite"><div className="conflict-panel-heading"><div><span className="roster-kicker">SCHEDULE VALIDATION</span><h3>{blockingCount ? `${blockingCount} blocking issue${blockingCount === 1 ? "" : "s"}` : `${warningCount} warning${warningCount === 1 ? "" : "s"}`}</h3></div><button className="roster-icon-button" onClick={() => setConflicts([])} aria-label="Dismiss conflict report">×</button></div><p className="conflict-guidance">Blocking issues must be fixed before publishing. Warnings can only be overridden by an authorized role with a recorded reason.</p><div className="conflict-list">{conflicts.map((conflict, index) => <article key={`${conflict.assignmentId}-${conflict.code}-${index}`} className={`conflict-item ${conflict.level.toLowerCase()}`}><span className="conflict-mark">{conflict.level === "BLOCKING" ? "!" : conflict.level === "OVERRIDABLE_WARNING" ? "△" : "i"}</span><div><b>{conflict.code.replaceAll("_", " ")}</b><p>{conflict.message}</p><small>{conflict.assignmentId.startsWith("input-") ? "Proposed duty" : `Duty ${conflict.assignmentId.slice(0, 8)}`}</small></div><span className="conflict-level">{conflict.level === "OVERRIDABLE_WARNING" ? "Warning" : conflict.level === "BLOCKING" ? "Blocking" : "Info"}</span></article>)}</div></section>}
-
-            {activeTab === "assignments" && <>
-              {isDraft && canWrite && <div className="roster-action-grid">
-                <form id="roster-edit-assignment" className="roster-form-card" onSubmit={(event) => { event.preventDefault(); const startsAt = new Date(zonedInputToIso(form.startsAt, timeZone)); const endsAt = new Date(zonedInputToIso(form.endsAt, timeZone)); if (startsAt >= endsAt) { toast.error("End time must be after start time."); return; } runMutation.mutate({ path: `/api/departments/${encodeURIComponent(departmentId)}/rosters/${encodeURIComponent(selectedId)}/assignments${editing ? `/${encodeURIComponent(editing.id)}` : ""}`, method: editing ? "PATCH" : "POST", body: { doctorId: form.doctorId, startsAt: startsAt.toISOString(), endsAt: endsAt.toISOString(), assignmentType: form.assignmentType, ...(form.exceptionNote.trim() ? { exceptionNote: form.exceptionNote.trim() } : {}) } }); }}>
-                  <div className="roster-form-heading"><span>01</span><div><b>{editing ? "Edit a duty" : "Add a duty"}</b><small>{editing ? "Update this draft assignment and recheck conflicts." : "Place a single assignment on this draft."}</small></div></div>
-                  <DoctorPicker label="Doctor" doctors={doctors} showAvailabilityFilter availability={dutyAvailabilityQuery.data?.doctors} availabilityLoading={dutyAvailabilityQuery.isFetching} availabilityError={dutyAvailabilityQuery.isError} hasTimeRange={Boolean(availabilityRange)} value={form.doctorId} search={doctorSearch} onSearch={setDoctorSearch} onChange={(doctorId) => setForm({ ...form, doctorId })}/>
-                  <div className="roster-input-pair"><label>Starts<input required type="datetime-local" value={form.startsAt} onChange={(event) => setForm({ ...form, startsAt: event.target.value })}/></label><label>Ends<input required type="datetime-local" value={form.endsAt} onChange={(event) => setForm({ ...form, endsAt: event.target.value })}/></label></div>
-                  <label>Duty type<select value={form.assignmentType} onChange={(event) => setForm({ ...form, assignmentType: event.target.value as Assignment["assignmentType"] })}><option value="IN_PERSON">In person</option><option value="TELECONSULTATION">Teleconsultation</option></select></label>
-                  <label>Exception note <span className="roster-optional">Optional</span><input maxLength={500} value={form.exceptionNote} onChange={(event) => setForm({ ...form, exceptionNote: event.target.value })} placeholder="Context for this one-off duty"/></label>
-                  <div className="roster-form-actions">{editing && <button type="button" className="button button-secondary" onClick={() => { setEditing(null); setForm({ doctorId: "", startsAt: "", endsAt: "", assignmentType: "IN_PERSON", exceptionNote: "" }); setDoctorSearch(""); }}>Cancel edit</button>}<button className="button button-secondary" disabled={runMutation.isPending || !form.doctorId || !form.startsAt || !form.endsAt}>{editing ? "Save changes" : "Add duty"}</button></div>
-                </form>
-                <form className="roster-form-card" onSubmit={(event) => { event.preventDefault(); const body = { doctorId: template.doctorId, dayOfWeek: Number(template.dayOfWeek), startMinute: fromMinuteInput(template.startTime), endMinute: fromMinuteInput(template.endTime), assignmentType: template.assignmentType, effectiveFrom: zonedDateInputToIso(template.effectiveFrom, timeZone), ...(template.effectiveUntil ? { effectiveUntil: zonedDateInputToIso(template.effectiveUntil, timeZone, true) } : { effectiveUntil: null }) }; if (body.endMinute <= body.startMinute) { toast.error("Pattern end time must be after its start time."); return; } runMutation.mutate({ path: `/api/departments/${encodeURIComponent(departmentId)}/rosters/${encodeURIComponent(selectedId)}/templates${editingTemplate ? `/${encodeURIComponent(editingTemplate.id)}` : ""}`, method: editingTemplate ? "PATCH" : "POST", body }); }}>
-                  <div className="roster-form-heading"><span>02</span><div><b>{editingTemplate ? "Edit weekly pattern" : "Add a weekly pattern"}</b><small>{editingTemplate ? "Update this recurring coverage pattern." : "Define recurring department coverage."}</small></div></div>
-                  <DoctorPicker label="Doctor" doctors={doctors} value={template.doctorId} search={templateDoctorSearch} onSearch={setTemplateDoctorSearch} onChange={(doctorId) => setTemplate({ ...template, doctorId })}/>
-                  <div className="roster-input-pair"><label>Weekday<select value={template.dayOfWeek} onChange={(event) => setTemplate({ ...template, dayOfWeek: event.target.value })}>{weekdayLabels.map((day, index) => <option key={day} value={index}>{day}</option>)}</select></label><label>Duty type<select value={template.assignmentType} onChange={(event) => setTemplate({ ...template, assignmentType: event.target.value as Assignment["assignmentType"] })}><option value="IN_PERSON">In person</option><option value="TELECONSULTATION">Teleconsultation</option></select></label></div>
-                  <div className="roster-input-pair"><label>Starts<input required type="time" value={template.startTime} onChange={(event) => setTemplate({ ...template, startTime: event.target.value })}/></label><label>Ends<input required type="time" value={template.endTime} onChange={(event) => setTemplate({ ...template, endTime: event.target.value })}/></label></div>
-                  <div className="roster-input-pair"><label>Effective from<input required type="date" value={template.effectiveFrom} onChange={(event) => setTemplate({ ...template, effectiveFrom: event.target.value })}/></label><label>Through <span className="roster-optional">Optional</span><input type="date" value={template.effectiveUntil} onChange={(event) => setTemplate({ ...template, effectiveUntil: event.target.value })}/></label></div>
-                  <div className="roster-form-actions">{editingTemplate && <button type="button" className="button button-secondary" onClick={() => { setEditingTemplate(null); setTemplate({ doctorId: "", dayOfWeek: "1", startTime: "09:00", endTime: "17:00", assignmentType: "IN_PERSON", effectiveFrom: "", effectiveUntil: "" }); setTemplateDoctorSearch(""); }}>Cancel edit</button>}<button className="button button-secondary" disabled={runMutation.isPending || !template.doctorId || !template.effectiveFrom}>{editingTemplate ? "Save pattern" : "Add weekly pattern"}</button></div>
-                </form>
-              </div>}
-              {isDraft && canWrite && <form className="roster-generate-bar" onSubmit={(event) => { event.preventDefault(); const from = zonedDateInputToIso(generation.from, timeZone); const through = zonedDateInputToIso(generation.through, timeZone, true); if (new Date(through) < new Date(from)) { toast.error("End date must be after start date."); return; } runMutation.mutate({ path: `/api/departments/${encodeURIComponent(departmentId)}/rosters/${encodeURIComponent(selectedId)}/generate`, body: { from, through } }); }}><div><b>Generate from weekly patterns</b><span>Only pattern generated duties are refreshed in this date range. Manually added or edited duties stay in place.</span></div><label>From<input required type="date" value={generation.from} onChange={(event) => setGeneration({ ...generation, from: event.target.value })}/></label><label>Through<input required type="date" value={generation.through} onChange={(event) => setGeneration({ ...generation, through: event.target.value })}/></label><button className="button button-primary" disabled={runMutation.isPending}>{runMutation.isPending ? "Generating…" : "Generate duties"}</button></form>}
-              <div className="roster-record-list"><div className="roster-record-heading"><div><h3>Scheduled duties</h3><p>Times shown in {timeZone}</p></div>{isDraft && canPublish && <button className="button button-primary" onClick={() => runMutation.mutate({ path: `/api/departments/${encodeURIComponent(departmentId)}/rosters/${encodeURIComponent(selectedId)}/publish`, body: overrideReason.trim() ? { overrideReason: overrideReason.trim() } : {} })} disabled={runMutation.isPending || blockingCount > 0 || (warningCount > 0 && (!canOverride || overrideReason.trim().length < 10))}>{runMutation.isPending ? "Validating…" : "Validate & publish"}</button>}</div>
-                {isDraft && warningCount > 0 && canOverride && <label className="override-reason">Authorized warning override reason<textarea minLength={10} maxLength={1000} value={overrideReason} onChange={(event) => setOverrideReason(event.target.value)} placeholder="Explain why publication should proceed despite the warning (at least 10 characters)."/><small>Only the Department Head, Hospital Admin, or Super Admin can publish with warnings. Blocking issues cannot be overridden.</small></label>}
-                {selected.assignments.length === 0 ? <div className="roster-list-state">No duties yet. Add one or create a weekly pattern and generate duties.</div> : selected.assignments.map((assignment) => <article className="roster-assignment" key={assignment.id}><span className="roster-assignment-mark">{assignment.assignmentType === "IN_PERSON" ? "IN" : "VC"}</span><div className="roster-assignment-main"><b>{doctorName.get(assignment.doctorId) ?? `Doctor ${assignment.doctorId.slice(0, 8)}`}</b><span>{dateLabel(assignment.startsAt, timeZone)} – {dateLabel(assignment.endsAt, timeZone)}</span>{assignment.exceptionNote && <small>{assignment.exceptionNote}</small>}</div><span className="roster-type-chip">{assignment.assignmentType === "IN_PERSON" ? "In person" : "Teleconsult"}</span>{isDraft && canWrite && <div className="roster-row-actions"><button aria-label="Edit duty" title="Edit duty" onClick={() => { setForm({ doctorId: assignment.doctorId, startsAt: toZonedInput(new Date(assignment.startsAt), timeZone), endsAt: toZonedInput(new Date(assignment.endsAt), timeZone), assignmentType: assignment.assignmentType, exceptionNote: assignment.exceptionNote ?? "" }); setDoctorSearch(""); setConflicts([]); setEditing({ ...assignment }); document.getElementById("roster-edit-assignment")?.scrollIntoView({ behavior: "smooth", block: "center" }); }}>Edit</button><button aria-label="Delete duty" title="Delete duty" onClick={() => { if (window.confirm("Delete this draft duty?")) runMutation.mutate({ path: `/api/departments/${encodeURIComponent(departmentId)}/rosters/${encodeURIComponent(selectedId)}/assignments/${encodeURIComponent(assignment.id)}`, method: "DELETE" }); }}>Delete</button></div>}</article>)}
-              </div>
-            </>}
-            {activeTab === "templates" && <div className="roster-record-list"><div className="roster-record-heading"><div><h3>Weekly patterns</h3><p>Patterns recur by hospital local weekday and time.</p></div></div>{selected.templates.length ? selected.templates.map((item) => <article className="roster-assignment" key={item.id}><span className="roster-assignment-mark">{weekdayShort[item.dayOfWeek]}</span><div className="roster-assignment-main"><b>{doctorName.get(item.doctorId) ?? `Doctor ${item.doctorId.slice(0, 8)}`}</b><span>{weekdayLabels[item.dayOfWeek]} · {minuteLabel(item.startMinute)}–{minuteLabel(item.endMinute)} · {item.assignmentType === "IN_PERSON" ? "In person" : "Teleconsultation"}</span><small>Effective {dateLabel(item.effectiveFrom, timeZone).split(",")[0]}{item.effectiveUntil ? ` through ${dateLabel(item.effectiveUntil, timeZone).split(",")[0]}` : " onward"}</small></div>{isDraft && canWrite && <div className="roster-row-actions"><button aria-label="Edit weekly pattern" onClick={() => { setTemplate({ doctorId: item.doctorId, dayOfWeek: String(item.dayOfWeek), startTime: minuteLabel(item.startMinute), endTime: minuteLabel(item.endMinute), assignmentType: item.assignmentType, effectiveFrom: toZonedInput(new Date(item.effectiveFrom), timeZone).slice(0, 10), effectiveUntil: item.effectiveUntil ? toZonedInput(new Date(item.effectiveUntil), timeZone).slice(0, 10) : "" }); setTemplateDoctorSearch(doctorName.get(item.doctorId) ?? ""); setEditingTemplate(item); setActiveTab("assignments"); setTimeout(() => document.querySelector(".roster-action-grid")?.scrollIntoView({ behavior: "smooth", block: "center" }), 0); }}>Edit</button><button aria-label="Delete weekly pattern" onClick={() => { if (window.confirm("Delete this weekly pattern? Existing generated duties will remain.")) runMutation.mutate({ path: `/api/departments/${encodeURIComponent(departmentId)}/rosters/${encodeURIComponent(selectedId)}/templates/${encodeURIComponent(item.id)}`, method: "DELETE" }); }}>Delete</button></div>}</article>) : <div className="roster-list-state">No weekly patterns yet. Add one from the Duties tab.</div>}</div>}
-            {activeTab === "revisions" && <div className="roster-record-list"><div className="roster-record-heading"><div><h3>Published snapshots</h3><p>Each publication is immutable. Make a new draft for later changes.</p></div></div>{revisionQuery.isPending ? <div className="roster-list-state">Loading revision history…</div> : revisionQuery.isError ? <div className="roster-list-state roster-inline-error">{revisionQuery.error.message}<button onClick={() => void revisionQuery.refetch()}>Retry</button></div> : revisionQuery.data?.length ? revisionQuery.data.map((revision) => <article className="roster-assignment" key={revision.id}><span className="roster-assignment-mark">r{revision.revision}</span><div className="roster-assignment-main"><b>Revision {revision.revision}</b><span>Published {dateLabel(revision.publishedAt, timeZone)}</span><small>Snapshot includes the assignments and validation result at publication.</small></div></article>) : <div className="roster-list-state">No published revisions for this roster.</div>}</div>}
-          </> : null}
-        </main>
-      </div>
-    </>}
-    {tourStep !== null && <aside className="roster-tour-card" role="dialog" aria-labelledby="roster-tour-title" aria-live="polite"><div className="roster-tour-header"><span>ROSTER GUIDE · {tourStep + 1} OF {tourSteps.length}</span><button onClick={() => changeTourStep(null)} aria-label="Close roster guide">×</button></div><h2 id="roster-tour-title">{tourSteps[tourStep].title}</h2><p>{tourSteps[tourStep].body}</p><div className="roster-tour-progress" aria-hidden="true">{tourSteps.map((step, index) => <i key={step.title} className={index <= tourStep ? "complete" : ""}/>)}</div><div className="roster-tour-actions"><button className="roster-tour-skip" onClick={() => changeTourStep(null)}>Skip guide</button><div>{tourStep > 0 && <button className="button button-secondary" onClick={() => changeTourStep(tourStep - 1)}>Back</button>}<button className="button button-primary" onClick={() => changeTourStep(tourStep === tourSteps.length - 1 ? null : tourStep + 1)}>{tourStep === tourSteps.length - 1 ? "Finish" : "Next"}</button></div></div></aside>}
-  </div>;
-}
-
-function DoctorPicker({ label, doctors, availability, availabilityLoading = false, availabilityError = false, hasTimeRange = false, showAvailabilityFilter = false, value, search, onSearch, onChange }: { label: string; doctors: Doctor[]; availability?: AvailabilityDoctor[]; availabilityLoading?: boolean; availabilityError?: boolean; hasTimeRange?: boolean; showAvailabilityFilter?: boolean; value: string; search: string; onSearch: (value: string) => void; onChange: (value: string) => void }) {
-  const [availableOnly, setAvailableOnly] = useState(false);
-  useEffect(() => {
-    if (availableOnly && value && availability && !availability.find((doctor) => doctor.doctorProfileId === value)?.isAvailable) onChange("");
-  }, [availableOnly, availability, value, onChange]);
-  const available = doctors.filter((doctor) => doctor.doctorProfileId);
-  const normalizedSearch = search.trim().toLocaleLowerCase();
-  const availabilityByProfile = new Map((availability ?? []).map((doctor) => [doctor.doctorProfileId, doctor]));
-  const matches = available.filter((doctor) => {
-    const matchesSearch = `${doctor.displayName} ${doctor.specialty ?? ""}`.toLocaleLowerCase().includes(normalizedSearch);
-    const status = availabilityByProfile.get(doctor.doctorProfileId);
-    return matchesSearch && (!availableOnly || status?.isAvailable === true);
+  const ruleMutation = useMutation({
+    mutationFn: async (variables: { ruleId: string; input: UpdateRosterRuleInput }) => {
+      if (!departmentId) throw new TimetableApiError("Select a department before saving.", 400, "DEPARTMENT_ID_REQUIRED");
+      return updateRosterRule(departmentId, variables.ruleId, variables.input);
+    },
+    onSuccess: async (result) => {
+      const warnings = result.generation.conflicts.length;
+      toast.success(warnings ? `Weekly rule saved with ${warnings} warning${warnings === 1 ? "" : "s"}.` : "Weekly rule updated");
+      setPanel({ kind: "none" });
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["timetable", "occurrences"] }),
+        queryClient.invalidateQueries({ queryKey: ["timetable", "rules"] }),
+        queryClient.invalidateQueries({ queryKey: ["timetable", "activity"] }),
+      ]);
+    },
+    onError: (error) => {
+      if (error instanceof TimetableApiError) setServerConflicts(error.conflicts);
+      toast.error(error instanceof Error ? error.message : "The weekly rule could not be saved.");
+    },
   });
-  return <div className="roster-doctor-picker"><label>{label}<input type="search" value={search} onChange={(event) => { onSearch(event.target.value); onChange(""); }} placeholder="Search by doctor or specialty" autoComplete="off"/></label>{showAvailabilityFilter && <><label className="roster-availability-filter"><input type="checkbox" checked={availableOnly} disabled={!availability || availabilityLoading || availabilityError} onChange={(event) => { const next = event.target.checked; setAvailableOnly(next); if (next && value && !availabilityByProfile.get(value)?.isAvailable) onChange(""); }}/>Show available doctors only</label><small>{!hasTimeRange ? "Enter a valid start and end time to check availability." : availabilityLoading ? "Checking department schedules, unavailability, and approved leave…" : availabilityError ? "Availability could not be checked. The save action will still validate for conflicts." : availability && !availability.some((doctor) => doctor.isAvailable) ? "No doctors are free for this window. Try another time or clear the availability filter." : availability ? "Availability is checked for this exact time range; save rechecks conflicts." : "Availability has not been checked yet."}</small></> }<select required value={value} onChange={(event) => onChange(event.target.value)}><option value="">{matches.length ? `Choose from ${matches.length} matching doctor${matches.length === 1 ? "" : "s"}` : availableOnly ? "No doctors are free for this time" : "No matching doctors"}</option>{matches.map((doctor) => { const status = availabilityByProfile.get(doctor.doctorProfileId); const optionLabel = `${doctor.displayName}${doctor.specialty ? ` · ${doctor.specialty}` : ""}`; return <option key={doctor.id} value={doctor.doctorProfileId!}>{optionLabel}{status ? status.isAvailable ? " · Available" : ` · Busy: ${status.reasons.join(", ")}` : ""}</option>; })}</select>{!available.length && <small>No active doctors with a profile are available in this department.</small>}</div>;
+
+  function retryQueries() {
+    void Promise.all([
+      doctorsQuery.refetch(),
+      roomsQuery.refetch(),
+      occurrencesQuery.refetch(),
+      activityQuery.refetch(),
+    ]);
+  }
+
+  function navigate(amount: number) {
+    const step = view === "week" ? amount * 7 : amount;
+    setAnchor((value) => addDays(parseLocalDate(value) ? value : today, step));
+  }
+
+  function openSlot(date: string, startMinute: number) {
+    if (!canWrite) return;
+    setErrors({});
+    setServerConflicts([]);
+    setPanel({
+      kind: "create",
+      date,
+      startMinute,
+      endMinute: Math.min(END_MINUTE, startMinute + SLOT_MINUTES),
+      doctorId: doctorFilter,
+      roomId: roomFilter,
+      repeatUntilDate: "",
+    });
+  }
+
+  function occurrenceAt(date: string, minute: number): RosterOccurrence | undefined {
+    return (eventsByDate.get(date) ?? []).find((occurrence) => {
+      const start = occurrenceMinute(occurrence.startsAt, timeZone) ?? START_MINUTE;
+      const rawEnd = occurrenceMinute(occurrence.endsAt, timeZone) ?? start + SLOT_MINUTES;
+      const end = rawEnd > start ? rawEnd : END_MINUTE;
+      return start <= minute && minute < end;
+    });
+  }
+
+  function handleCellClick(date: string, slotStart: number) {
+    const occurrence = occurrenceAt(date, slotStart);
+    if (occurrence) {
+      openOccurrence(occurrence);
+      return;
+    }
+    if (!canWrite || isPastDate(date, today)) return;
+    openSlot(date, slotStart);
+  }
+
+  function canEditOccurrence(occurrence: RosterOccurrence): boolean {
+    return canWrite
+      && !occurrenceIsPast(occurrence, timeZone, clock)
+      && occurrenceStartsFuture(occurrence, timeZone, clock)
+      && occurrence.status === "SCHEDULED";
+  }
+
+  function openOccurrence(occurrence: RosterOccurrence) {
+    setErrors({});
+    setServerConflicts([]);
+    setPanel({ kind: "choose", occurrenceId: occurrence.id });
+  }
+
+  function openEdit(occurrence: RosterOccurrence) {
+    if (!canEditOccurrence(occurrence)) return;
+    setErrors({});
+    setServerConflicts([]);
+    const startMinute = occurrenceMinute(occurrence.startsAt, timeZone) ?? START_MINUTE;
+    const derivedEnd = occurrenceMinute(occurrence.endsAt, timeZone) ?? startMinute + SLOT_MINUTES;
+    setPanel({
+      kind: "edit",
+      occurrenceId: occurrence.id,
+      startMinute,
+      endMinute: derivedEnd > startMinute ? derivedEnd : END_MINUTE,
+      doctorId: occurrence.doctorId,
+      roomId: occurrence.roomId,
+      scope: "THIS_DATE",
+      reason: "",
+    });
+  }
+
+  function closePanel() {
+    setPanel({ kind: "none" });
+    setErrors({});
+    setServerConflicts([]);
+  }
+
+  function setFieldError(key: string, message: string) {
+    setErrors((currentErrors) => ({ ...currentErrors, [key]: message }));
+  }
+
+  function validateWritableDate(date: string): boolean {
+    if (!parseLocalDate(date)) {
+      setFieldError("date", "Choose a valid date.");
+      return false;
+    }
+    if (isPastDate(date, clock.date)) {
+      setFieldError("date", "Choose today or a future date.");
+      return false;
+    }
+    return true;
+  }
+
+  function doctorAvailabilityError(doctorId: string): string | undefined {
+    const item = doctorAvailabilityById.get(doctorId);
+    if (!item || item.status !== "UNAVAILABLE") return undefined;
+    const reasons = item.conflicts.map((conflict) => doctorConflictLabel(conflict.code, conflict.message));
+    return reasons.length ? `Doctor unavailable: ${[...new Set(reasons)].join(" · ")}` : "Doctor is unavailable at this time.";
+  }
+
+  function submitCreate() {
+    if (panel.kind !== "create" || !canWrite) return;
+    const nextErrors: FieldErrors = {};
+    if (!validateWritableDate(panel.date)) nextErrors.date = errors.date || "Choose a valid future date.";
+    if (panel.endMinute <= panel.startMinute) nextErrors.end = "End time must be after start time.";
+    if (!panel.doctorId) nextErrors.doctor = "Choose a doctor.";
+    else {
+      const unavailable = doctorAvailabilityError(panel.doctorId);
+      if (unavailable) nextErrors.doctor = unavailable;
+    }
+    if (!panel.roomId) nextErrors.room = "Choose a room.";
+    if (panel.repeatUntilDate) {
+      if (!parseLocalDate(panel.repeatUntilDate) || isPastDate(panel.repeatUntilDate, clock.date)) nextErrors.repeatUntilDate = "Choose a valid future repeat date.";
+      else if (panel.repeatUntilDate < panel.date) nextErrors.repeatUntilDate = "Repeat until cannot be before the duty date.";
+    }
+    if (Object.keys(nextErrors).length) {
+      setErrors(nextErrors);
+      toast.error("Check the duty details before saving.");
+      return;
+    }
+    const input: CreateOccurrenceInput = {
+      doctorId: panel.doctorId,
+      roomId: panel.roomId,
+      occurrenceDate: panel.date,
+      startMinute: panel.startMinute,
+      endMinute: panel.endMinute,
+      ...(panel.repeatUntilDate ? { repeatUntilDate: panel.repeatUntilDate } : {}),
+    };
+    mutation.mutate({ kind: "create", input });
+  }
+
+  function submitEdit() {
+    if (panel.kind !== "edit" || !panelOccurrence || !canWrite) return;
+    const nextErrors: FieldErrors = {};
+    if (occurrenceIsPast(panelOccurrence, timeZone, clock)) nextErrors.date = "Past duties cannot be changed.";
+    if (panel.endMinute <= panel.startMinute) nextErrors.end = "End time must be after start time.";
+    if (!panel.doctorId) nextErrors.doctor = "Choose a doctor.";
+    else {
+      const unavailable = doctorAvailabilityError(panel.doctorId);
+      if (unavailable) nextErrors.doctor = unavailable;
+    }
+    if (!panel.roomId) nextErrors.room = "Choose a room.";
+    if (panel.reason.trim().length < 3) nextErrors.reason = "Give a reason with at least 3 characters.";
+    if (Object.keys(nextErrors).length) {
+      setErrors(nextErrors);
+      toast.error("Check the duty changes before saving.");
+      return;
+    }
+    const input: PatchInput = {
+      scope: panel.scope,
+      doctorId: panel.doctorId,
+      roomId: panel.roomId,
+      startMinute: panel.startMinute,
+      endMinute: panel.endMinute,
+      reason: panel.reason.trim(),
+    };
+    mutation.mutate({ kind: "edit", occurrenceId: panelOccurrence.id, input });
+  }
+
+  function submitCancel() {
+    if (panel.kind !== "cancel" || !panelOccurrence || !canWrite) return;
+    const nextErrors: FieldErrors = {};
+    if (occurrenceIsPast(panelOccurrence, timeZone, clock)) nextErrors.date = "Past duties cannot be cancelled.";
+    if (panel.reason.trim().length < 3) nextErrors.reason = "Give a reason with at least 3 characters.";
+    if (Object.keys(nextErrors).length) {
+      setErrors(nextErrors);
+      toast.error("A reason is required to cancel a duty.");
+      return;
+    }
+    const input: CancelInput = { scope: panel.scope, reason: panel.reason.trim() };
+    mutation.mutate({ kind: "cancel", occurrenceId: panelOccurrence.id, input });
+  }
+
+  function submitRule() {
+    if (panel.kind !== "rule" || !canWrite) return;
+    const nextErrors: FieldErrors = {};
+    if (panel.weekday < 1 || panel.weekday > 7) nextErrors.weekday = "Choose a weekday.";
+    if (panel.endMinute <= panel.startMinute) nextErrors.end = "End time must be after start time.";
+    if (!parseLocalDate(panel.effectiveFrom)) nextErrors.effectiveFrom = "Choose a valid start date.";
+    if (panel.effectiveUntil) {
+      if (!parseLocalDate(panel.effectiveUntil)) nextErrors.effectiveUntil = "Choose a valid end date.";
+      else if (panel.effectiveUntil < panel.effectiveFrom) nextErrors.effectiveUntil = "End date cannot be before start date.";
+    }
+    if (Object.keys(nextErrors).length) {
+      setErrors(nextErrors);
+      toast.error("Check the weekly rule before saving.");
+      return;
+    }
+    const input: UpdateRosterRuleInput = {
+      weekday: panel.weekday,
+      startMinute: panel.startMinute,
+      endMinute: panel.endMinute,
+      effectiveFrom: panel.effectiveFrom,
+      effectiveUntil: panel.effectiveUntil || null,
+    };
+    ruleMutation.mutate({ ruleId: panel.ruleId, input });
+  }
+
+  function renderConflicts(conflicts: OccurrenceConflict[]) {
+    if (!conflicts.length) return null;
+    return (
+      <div className="timetable-conflicts" aria-live="polite">
+        {conflicts.map((conflict, index) => (
+          <div
+            key={`${conflict.code}-${conflict.occurrenceId}-${index}`}
+            className={`timetable-conflict ${conflict.level === "BLOCKING" ? "timetable-conflict--blocking" : conflict.level === "OVERRIDABLE_WARNING" ? "timetable-conflict--warning" : ""}`}
+          >
+            <span className="timetable-conflict-code">{conflict.code.replaceAll("_", " ")}</span>
+            <span>{conflict.message}</span>
+          </div>
+        ))}
+      </div>
+    );
+  }
+
+  function renderEditorPanel() {
+    if (panel.kind === "none") {
+      return (
+        <section className="timetable-editor" aria-label="Timetable editor">
+          <div className="timetable-editor-head"><h2>No duty selected</h2><p>Choose an open time slot to schedule a duty, or select an existing duty to review it.</p></div>
+          <p className="timetable-hint">{canWrite ? "All changes are saved directly to the department timetable." : "You have read-only access to this timetable."}</p>
+        </section>
+      );
+    }
+
+    if (panel.kind === "choose") {
+      if (!panelOccurrence) {
+        return (
+          <section className="timetable-editor" aria-label="Duty unavailable">
+            <div className="timetable-editor-head"><h2>Duty unavailable</h2><p>This duty is no longer in the current timetable range.</p></div>
+            <div className="timetable-editor-actions"><button type="button" className="timetable-secondary" onClick={closePanel}>Close</button></div>
+          </section>
+        );
+      }
+      const start = occurrenceMinute(panelOccurrence.startsAt, timeZone) ?? START_MINUTE;
+      const rawEnd = occurrenceMinute(panelOccurrence.endsAt, timeZone) ?? start + SLOT_MINUTES;
+      const end = rawEnd > start ? rawEnd : END_MINUTE;
+      const editable = canEditOccurrence(panelOccurrence);
+      const conflicts = panelOccurrence.conflicts ?? [];
+      const rule = panelOccurrence.roster;
+      return (
+        <section className="timetable-editor" aria-label="Scheduled duty options">
+          <div className="timetable-editor-head"><h2>Scheduled duty</h2><p>Choose what you want to do with this timetable entry.</p></div>
+          <div className="timetable-editor-form">
+            <div className="grid gap-1 rounded-lg border border-dashed border-[var(--border)] bg-[var(--info-bg)] p-3 text-[12px] leading-relaxed text-[var(--info)]">
+              <b className="text-[13px] font-semibold">{doctorLabel(panelOccurrence, doctorsById)} · {roomDescription(panelOccurrence, roomsById)}</b>
+              <span>{readableDate(panelOccurrence.occurrenceDate)} · {minuteLabel(start)}–{minuteLabel(end)} · {timeZone}</span>
+              <span>Status: {statusText(panelOccurrence.status)}{occurrenceIsPast(panelOccurrence, timeZone, clock) ? " · Past" : ""}</span>
+            </div>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <button
+                type="button"
+                className="group flex min-h-28 flex-col items-start gap-2 rounded-xl border border-[var(--border)] bg-[var(--surface-muted)] p-4 text-left transition-all duration-200 ease-out hover:-translate-y-0.5 hover:border-[var(--primary)] hover:bg-[var(--surface)] hover:shadow-md active:translate-y-0"
+                onClick={() => setPanel({ kind: "detail", occurrenceId: panelOccurrence.id })}
+              >
+                <span className="grid h-9 w-9 place-items-center rounded-lg bg-[var(--surface)] text-[18px] text-[var(--primary)]">↗</span>
+                <b className="text-[14px] font-semibold">View details</b>
+                <span className="text-[12px] leading-relaxed text-[var(--muted)]">Read the assignment, status, room, and any recorded conflicts.</span>
+              </button>
+              <button
+                type="button"
+                disabled={!editable}
+                className="group flex min-h-28 flex-col items-start gap-2 rounded-xl border border-[var(--border)] bg-[var(--surface-muted)] p-4 text-left transition-all duration-200 ease-out hover:-translate-y-0.5 hover:border-[var(--primary)] hover:bg-[var(--surface)] hover:shadow-md active:translate-y-0 disabled:cursor-not-allowed disabled:opacity-55 disabled:hover:translate-y-0 disabled:hover:border-[var(--border)] disabled:hover:shadow-none"
+                onClick={() => openEdit(panelOccurrence)}
+              >
+                <span className="grid h-9 w-9 place-items-center rounded-lg bg-[var(--surface)] text-[18px] text-[var(--primary)]">✎</span>
+                <b className="text-[14px] font-semibold">Edit duty</b>
+                <span className="text-[12px] leading-relaxed text-[var(--muted)]">{editable ? "Change time, doctor, room, scope, or reason." : "Editing is unavailable for past, cancelled, or read-only entries."}</span>
+              </button>
+            </div>
+            {rule ? (
+              <div className="grid gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface-muted)] p-3">
+                <div className="grid gap-1 text-[12px] leading-relaxed text-[var(--muted)]">
+                  <b className="text-[13px] font-semibold text-[var(--foreground)]">Weekly recurrence</b>
+                  <span>{WEEKDAY_LONG[rule.weekday % 7]} · {minuteLabel(rule.startMinute)}–{minuteLabel(rule.endMinute)} · {readableDate(rule.effectiveFrom)}{rule.effectiveUntil ? ` to ${readableDate(rule.effectiveUntil)}` : " · ongoing"}</span>
+                  <span>{occurrenceIsPast(panelOccurrence, timeZone, clock) ? "Past dated duties stay unchanged. Editing the weekly rule updates future occurrences." : "This duty comes from a weekly rule. Editing it updates future occurrences."}</span>
+                </div>
+                <button
+                  type="button"
+                  disabled={!canWrite}
+                  className="justify-self-start rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-[12px] font-semibold text-[var(--primary)] transition-all duration-200 ease-out hover:-translate-y-0.5 hover:border-[var(--primary)] active:translate-y-0 disabled:cursor-not-allowed disabled:opacity-60"
+                  onClick={() => {
+                    setErrors({});
+                    setServerConflicts([]);
+                    setPanel({
+                      kind: "rule",
+                      ruleId: rule.id,
+                      weekday: rule.weekday,
+                      startMinute: rule.startMinute,
+                      endMinute: rule.endMinute,
+                      effectiveFrom: rule.effectiveFrom,
+                      effectiveUntil: rule.effectiveUntil ?? "",
+                    });
+                  }}
+                >Edit weekly rule</button>
+              </div>
+            ) : null}
+            {renderConflicts(conflicts)}
+            <div className="timetable-editor-actions">
+              <button type="button" className="timetable-secondary transition-transform duration-200 ease-out hover:-translate-y-0.5 active:translate-y-0" onClick={closePanel}>Close</button>
+            </div>
+          </div>
+        </section>
+      );
+    }
+
+    if (panel.kind === "create") {
+      return (
+        <section className="timetable-editor" aria-label="Schedule a duty">
+          <div className="timetable-editor-head"><h2>Schedule a duty</h2><p>Create a duty directly on the timetable.</p></div>
+          <form className="timetable-editor-form" noValidate onSubmit={(event) => { event.preventDefault(); submitCreate(); }}>
+            <div className="grid gap-1 rounded-lg border border-dashed border-[var(--border)] bg-[var(--info-bg)] p-3 text-[12px] leading-relaxed text-[var(--info)]">
+              <b className="text-[13px] font-semibold">{readableDate(panel.date)} · {minuteLabel(panel.startMinute)}–{minuteLabel(panel.endMinute)}</b>
+              <span>Times use {timeZone}. Choose a doctor and room, then save the duty.</span>
+            </div>
+            <div className="timetable-form-grid">
+              <label className="timetable-field">Date
+                <input type="date" value={panel.date} aria-invalid={Boolean(errors.date)} onChange={(event) => setPanel({ ...panel, date: event.target.value })} />
+                {errors.date ? <span className="timetable-hint">{errors.date}</span> : null}
+              </label>
+              <label className="timetable-field">Start time
+                <input type="time" value={minuteLabel(panel.startMinute)} onChange={(event) => setPanel({ ...panel, startMinute: parseTimeInput(event.target.value) ?? panel.startMinute })} />
+              </label>
+              <label className="timetable-field">End time
+                <input type="time" value={minuteLabel(panel.endMinute)} aria-invalid={Boolean(errors.end)} onChange={(event) => setPanel({ ...panel, endMinute: parseTimeInput(event.target.value) ?? panel.endMinute })} />
+                {errors.end ? <span className="timetable-hint">{errors.end}</span> : null}
+              </label>
+              <div className="min-w-0 [grid-column:1/-1]">
+                <DoctorPicker
+                  doctors={doctors}
+                  availability={doctorAvailability}
+                  value={panel.doctorId}
+                  onChange={(doctorId) => setPanel({ ...panel, doctorId })}
+                  invalid={Boolean(errors.doctor)}
+                  disabled={!canWrite || mutation.isPending}
+                  loading={availabilityQuery.isPending}
+                  error={availabilityQuery.isError ? "Availability could not be checked. The backend will validate on save." : errors.doctor}
+                  timeZone={timeZone}
+                />
+              </div>
+              <label className="timetable-field">Room
+                <select className="timetable-select" value={panel.roomId} aria-invalid={Boolean(errors.room)} onChange={(event) => setPanel({ ...panel, roomId: event.target.value })}>
+                  <option value="">Choose a room</option>
+                  {rooms.filter((room) => room.isActive).map((room) => <option key={room.id} value={room.id}>{room.roomNumber} · {room.roomType}{room.floor ? ` · Floor ${room.floor}` : ""}</option>)}
+                </select>
+                {errors.room ? <span className="timetable-hint">{errors.room}</span> : null}
+              </label>
+              <label className="timetable-field">Repeat until <span className="timetable-hint">Optional</span>
+                <input type="date" value={panel.repeatUntilDate} aria-invalid={Boolean(errors.repeatUntilDate)} onChange={(event) => setPanel({ ...panel, repeatUntilDate: event.target.value })} />
+                {errors.repeatUntilDate ? <span className="timetable-hint">{errors.repeatUntilDate}</span> : null}
+              </label>
+            </div>
+            {renderConflicts(serverConflicts)}
+            <div className="timetable-editor-actions">
+              <button type="submit" className="timetable-primary transition-transform duration-200 ease-out hover:-translate-y-0.5 active:translate-y-0" disabled={!canWrite || mutation.isPending || availabilityQuery.isPending}>{mutation.isPending ? "Saving…" : availabilityQuery.isPending ? "Checking…" : "Save duty"}</button>
+              <button type="button" className="timetable-secondary transition-transform duration-200 ease-out hover:-translate-y-0.5 active:translate-y-0" onClick={closePanel}>Cancel</button>
+            </div>
+            <p className="timetable-hint">Times are shown in {timeZone}. Repeated duties stop on the date you choose.</p>
+          </form>
+        </section>
+      );
+    }
+
+    if (panel.kind === "rule") {
+      return (
+        <section className="timetable-editor" aria-label="Edit weekly rule">
+          <div className="timetable-editor-head"><h2>Edit weekly rule</h2><p>Change the recurring pattern that generates future duties.</p></div>
+          <form className="timetable-editor-form" noValidate onSubmit={(event) => { event.preventDefault(); submitRule(); }}>
+            <div className="grid gap-1 rounded-lg border border-dashed border-[var(--border)] bg-[var(--info-bg)] p-3 text-[12px] leading-relaxed text-[var(--info)]">
+              <b className="text-[13px] font-semibold">Weekly recurring roster</b>
+              <span>Past dated occurrences stay unchanged. Changes apply to future generated duties from the effective date.</span>
+            </div>
+            <div className="timetable-form-grid">
+              <label className="timetable-field">Weekday
+                <select className="timetable-select" value={panel.weekday} aria-invalid={Boolean(errors.weekday)} disabled={!canWrite} onChange={(event) => setPanel({ ...panel, weekday: Number(event.target.value) })}>
+                  {[1, 2, 3, 4, 5, 6, 7].map((value) => <option key={value} value={value}>{WEEKDAY_LONG[value % 7]}</option>)}
+                </select>
+                {errors.weekday ? <span className="timetable-hint">{errors.weekday}</span> : null}
+              </label>
+              <label className="timetable-field">Start time
+                <input type="time" value={minuteLabel(panel.startMinute)} disabled={!canWrite} onChange={(event) => setPanel({ ...panel, startMinute: parseTimeInput(event.target.value) ?? panel.startMinute })} />
+              </label>
+              <label className="timetable-field">End time
+                <input type="time" value={minuteLabel(panel.endMinute)} aria-invalid={Boolean(errors.end)} disabled={!canWrite} onChange={(event) => setPanel({ ...panel, endMinute: parseTimeInput(event.target.value) ?? panel.endMinute })} />
+                {errors.end ? <span className="timetable-hint">{errors.end}</span> : null}
+              </label>
+              <label className="timetable-field">Effective from
+                <input type="date" value={panel.effectiveFrom} aria-invalid={Boolean(errors.effectiveFrom)} disabled={!canWrite} onChange={(event) => setPanel({ ...panel, effectiveFrom: event.target.value })} />
+                {errors.effectiveFrom ? <span className="timetable-hint">{errors.effectiveFrom}</span> : null}
+              </label>
+              <label className="timetable-field">Effective until <span className="timetable-hint">Optional</span>
+                <input type="date" value={panel.effectiveUntil} aria-invalid={Boolean(errors.effectiveUntil)} disabled={!canWrite} onChange={(event) => setPanel({ ...panel, effectiveUntil: event.target.value })} />
+                {errors.effectiveUntil ? <span className="timetable-hint">{errors.effectiveUntil}</span> : null}
+              </label>
+            </div>
+            {renderConflicts(serverConflicts)}
+            <div className="timetable-editor-actions">
+              <button type="submit" className="timetable-primary transition-transform duration-200 ease-out hover:-translate-y-0.5 active:translate-y-0" disabled={!canWrite || ruleMutation.isPending}>{ruleMutation.isPending ? "Saving…" : "Save weekly rule"}</button>
+              <button type="button" className="timetable-secondary transition-transform duration-200 ease-out hover:-translate-y-0.5 active:translate-y-0" onClick={closePanel}>Close</button>
+            </div>
+            <p className="timetable-hint">Times are shown in {timeZone}. Blocking conflicts stop the rule update.</p>
+          </form>
+        </section>
+      );
+    }
+
+    if (!panelOccurrence) {
+      return (
+        <section className="timetable-editor" aria-label="Timetable editor">
+          <div className="timetable-editor-head"><h2>Duty unavailable</h2><p>This duty is no longer in the current timetable range.</p></div>
+          <div className="timetable-editor-actions"><button type="button" className="timetable-secondary" onClick={closePanel}>Close</button></div>
+        </section>
+      );
+    }
+
+    const displayStart = occurrenceMinute(panelOccurrence.startsAt, timeZone);
+    const displayEnd = occurrenceMinute(panelOccurrence.endsAt, timeZone);
+    const displayRange = `${displayStart === null ? "—" : minuteLabel(displayStart)}–${displayEnd === null ? "—" : minuteLabel(displayEnd)}`;
+    const currentRoom = roomDescription(panelOccurrence, roomsById);
+    const currentDoctor = doctorLabel(panelOccurrence, doctorsById);
+    const currentConflicts = panelOccurrence.conflicts ?? [];
+
+    if (panel.kind === "detail") {
+      return (
+        <section className="timetable-editor" aria-label="Duty details">
+          <div className="timetable-editor-head"><h2>Duty details</h2><p>Read-only summary for this timetable entry.</p></div>
+          <div className="timetable-readonly">
+            <p><b>Date</b><span>{readableDate(panelOccurrence.occurrenceDate)}</span></p>
+            <p><b>Time</b><span>{displayRange} · {timeZone}</span></p>
+            <p><b>Doctor</b><span>{currentDoctor}</span></p>
+            <p><b>Room</b><span>{currentRoom}</span></p>
+            <p><b>Status</b><span>{statusText(panelOccurrence.status)}{occurrenceIsPast(panelOccurrence, timeZone, clock) ? " · Past" : ""}</span></p>
+            {panelOccurrence.override?.reason ? <p><b>Reason</b><span>{panelOccurrence.override.reason}</span></p> : null}
+          </div>
+          {currentConflicts.length ? <p className="timetable-hint">Conflicts: {conflictSummary(currentConflicts)}</p> : null}
+          {renderConflicts(currentConflicts)}
+          <div className="timetable-editor-actions"><button type="button" className="timetable-secondary" onClick={closePanel}>Close</button></div>
+        </section>
+      );
+    }
+
+    if (panel.kind === "cancel") {
+      return (
+        <section className="timetable-editor" aria-label="Cancel duty">
+          <div className="timetable-editor-head"><h2>Cancel duty</h2><p>{currentDoctor} · {currentRoom} · {readableDate(panelOccurrence.occurrenceDate)}</p></div>
+          <form className="timetable-editor-form" noValidate onSubmit={(event) => { event.preventDefault(); submitCancel(); }}>
+            <div className="timetable-form-grid">
+              <label className="timetable-field">Scope
+                <select className="timetable-select" value={panel.scope} onChange={(event) => setPanel({ ...panel, scope: event.target.value as Scope })}>
+                  <option value="THIS_DATE">This date</option>
+                  <option value="THIS_AND_FUTURE">This and future dates</option>
+                </select>
+              </label>
+              <label className="timetable-field">Reason
+                <textarea value={panel.reason} aria-invalid={Boolean(errors.reason)} onChange={(event) => setPanel({ ...panel, reason: event.target.value })} />
+                {errors.reason ? <span className="timetable-hint">{errors.reason}</span> : null}
+              </label>
+            </div>
+            {errors.date ? <p className="timetable-hint">{errors.date}</p> : null}
+            {renderConflicts(serverConflicts)}
+            <div className="timetable-editor-actions">
+              <button type="submit" className="timetable-danger" disabled={!canWrite || mutation.isPending}>{mutation.isPending ? "Cancelling…" : "Confirm cancellation"}</button>
+              <button type="button" className="timetable-secondary" onClick={() => {
+                const start = occurrenceMinute(panelOccurrence.startsAt, timeZone) ?? START_MINUTE;
+                const derivedEnd = occurrenceMinute(panelOccurrence.endsAt, timeZone) ?? start + SLOT_MINUTES;
+                setErrors({});
+                setServerConflicts([]);
+                setPanel({ kind: "edit", occurrenceId: panelOccurrence.id, startMinute: start, endMinute: derivedEnd > start ? derivedEnd : END_MINUTE, doctorId: panelOccurrence.doctorId, roomId: panelOccurrence.roomId, scope: panel.scope, reason: panel.reason });
+              }}>Back</button>
+            </div>
+          </form>
+        </section>
+      );
+    }
+
+    return (
+      <section className="timetable-editor" aria-label="Edit duty">
+        <div className="timetable-editor-head"><h2>Edit duty</h2><p>{currentDoctor} · {currentRoom}</p></div>
+        <form className="timetable-editor-form" noValidate onSubmit={(event) => { event.preventDefault(); submitEdit(); }}>
+          <div className="timetable-form-grid">
+            <div className="timetable-field">Date<span className="timetable-readonly">{readableDate(panelOccurrence.occurrenceDate)}</span>{errors.date ? <span className="timetable-hint">{errors.date}</span> : null}</div>
+            <label className="timetable-field">Start time
+              <input type="time" value={minuteLabel(panel.startMinute)} onChange={(event) => setPanel({ ...panel, startMinute: parseTimeInput(event.target.value) ?? panel.startMinute })} />
+            </label>
+            <label className="timetable-field">End time
+              <input type="time" value={minuteLabel(panel.endMinute)} aria-invalid={Boolean(errors.end)} onChange={(event) => setPanel({ ...panel, endMinute: parseTimeInput(event.target.value) ?? panel.endMinute })} />
+              {errors.end ? <span className="timetable-hint">{errors.end}</span> : null}
+            </label>
+            <div className="min-w-0 [grid-column:1/-1]">
+              <DoctorPicker
+                doctors={doctors}
+                availability={doctorAvailability}
+                value={panel.doctorId}
+                onChange={(doctorId) => setPanel({ ...panel, doctorId })}
+                invalid={Boolean(errors.doctor)}
+                disabled={!canWrite || mutation.isPending}
+                loading={availabilityQuery.isPending}
+                error={availabilityQuery.isError ? "Availability could not be checked. The backend will validate on save." : errors.doctor}
+                timeZone={timeZone}
+              />
+            </div>
+            <label className="timetable-field">Room
+              <select className="timetable-select" value={panel.roomId} aria-invalid={Boolean(errors.room)} onChange={(event) => setPanel({ ...panel, roomId: event.target.value })}>
+                {rooms.map((room) => <option key={room.id} value={room.id} disabled={!room.isActive && room.id !== panel.roomId}>{room.roomNumber} · {room.roomType}{room.isActive ? "" : " · Inactive"}</option>)}
+              </select>
+              {errors.room ? <span className="timetable-hint">{errors.room}</span> : null}
+            </label>
+            <label className="timetable-field">Scope
+              <select className="timetable-select" value={panel.scope} onChange={(event) => setPanel({ ...panel, scope: event.target.value as Scope })}>
+                <option value="THIS_DATE">This date</option>
+                <option value="THIS_AND_FUTURE">This and future dates</option>
+              </select>
+            </label>
+            <label className="timetable-field">Reason
+              <textarea value={panel.reason} aria-invalid={Boolean(errors.reason)} onChange={(event) => setPanel({ ...panel, reason: event.target.value })} />
+              {errors.reason ? <span className="timetable-hint">{errors.reason}</span> : null}
+            </label>
+          </div>
+          {renderConflicts(serverConflicts.length ? serverConflicts : currentConflicts)}
+          <div className="timetable-editor-actions">
+            <button type="submit" className="timetable-primary" disabled={!canWrite || mutation.isPending || availabilityQuery.isPending}>{mutation.isPending ? "Saving…" : availabilityQuery.isPending ? "Checking…" : "Save changes"}</button>
+            <button type="button" className="timetable-danger" disabled={!canWrite || mutation.isPending} onClick={() => { setErrors({}); setServerConflicts([]); setPanel({ kind: "cancel", occurrenceId: panelOccurrence.id, scope: panel.scope, reason: panel.reason }); }}>Cancel duty</button>
+            <button type="button" className="timetable-secondary" onClick={closePanel}>Close</button>
+          </div>
+          <p className="timetable-hint">A reason of at least 3 characters is recorded for every change.</p>
+        </form>
+      </section>
+    );
+  }
+
+  function renderEditor() {
+    if (panel.kind === "none") {
+      return <p className="timetable-editor-hint">{canWrite ? "Select an open slot to schedule a duty, or select an existing duty to review it." : "You have read-only access to this timetable."}</p>;
+    }
+    const dialogLabel = panel.kind === "choose" ? "Scheduled duty options" : panel.kind === "create" ? "Schedule a duty" : panel.kind === "edit" ? "Edit duty" : panel.kind === "cancel" ? "Cancel duty" : panel.kind === "rule" ? "Edit weekly rule" : "Duty details";
+    return (
+      <div className="timetable-modal-layer animate-[eyezen-overlay-in_160ms_ease-out_both]" onMouseDown={(event) => { if (event.target === event.currentTarget) closePanel(); }}>
+        <div className="timetable-modal relative animate-[eyezen-dialog-in_220ms_ease-out_both]" role="dialog" aria-modal="true" aria-label={dialogLabel} tabIndex={-1} ref={dialogRef}>
+          <button
+            type="button"
+            className="absolute right-3 top-3 z-10 grid h-9 w-9 place-items-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[18px] leading-none text-[var(--muted)] transition-all duration-200 ease-out hover:-translate-y-0.5 hover:border-[var(--primary)] hover:text-[var(--primary)] active:translate-y-0"
+            aria-label="Close dialog"
+            onClick={closePanel}
+          >×</button>
+          {renderEditorPanel()}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="timetable-workspace">
+      {current.isPending ? <div className="timetable-state">Checking roster access…</div> : null}
+      {current.isError ? (
+        <div className="timetable-state timetable-state--error">
+          <span>Your workspace could not be verified.</span>
+          <button type="button" onClick={() => void current.refetch()}>Retry</button>
+        </div>
+      ) : null}
+      {!current.isPending && !current.isError && !accessAllowed ? (
+        <div className="timetable-state">This timetable is managed by roster staff. Doctors should use My schedule to review their own duties.</div>
+      ) : null}
+      {!current.isPending && !current.isError && accessAllowed && !departmentId ? (
+        <div className="timetable-state">Select a department to open its timetable.</div>
+      ) : null}
+      {!current.isPending && !current.isError && accessAllowed && departmentId ? (
+        <>
+          <section className="timetable-overview" aria-label="Timetable overview">
+            <div className="timetable-overview-copy">
+              <span className="timetable-overline">Department timetable</span>
+              <h2>{selectedDepartment?.name ?? "Department"}{selectedDepartment?.code ? ` · ${selectedDepartment.code}` : ""}</h2>
+              <p>Schedule and adjust duties directly on the calendar. Every change is saved immediately.</p>
+            </div>
+            <div className="timetable-metric"><b>{scheduledCount}</b><span>Scheduled</span></div>
+            <div className="timetable-metric"><b>{conflictCount}</b><span>Conflicts</span></div>
+            <div className="timetable-metric"><b>{blockingCount}</b><span>Blocking</span></div>
+            <div className="timetable-metric"><b>{rooms.length}</b><span>Rooms</span></div>
+          </section>
+
+          <div className="timetable-toolbar">
+            <div className="timetable-toolbar-group timetable-nav">
+              <button type="button" onClick={() => navigate(-1)} aria-label={`Previous ${view}`}>Previous</button>
+              <button type="button" onClick={() => setAnchor(browserToday())}>Today</button>
+              <button type="button" onClick={() => navigate(1)} aria-label={`Next ${view}`}>Next</button>
+            </div>
+            <div className="timetable-toolbar-group timetable-segmented" aria-label="Calendar view">
+              <button type="button" className={view === "day" ? "is-active" : ""} aria-pressed={view === "day"} onClick={() => setView("day")}>Day</button>
+              <button type="button" className={view === "week" ? "is-active" : ""} aria-pressed={view === "week"} onClick={() => setView("week")}>Week</button>
+            </div>
+            <div className="timetable-toolbar-group">
+              <label className="timetable-field">Doctor
+                <select className="timetable-select" value={doctorFilter} onChange={(event) => setDoctorFilter(event.target.value)}>
+                  <option value="">All doctors</option>
+                  {doctors.map((doctor) => <option key={doctor.id} value={doctor.id}>{doctor.displayName}</option>)}
+                </select>
+              </label>
+              <label className="timetable-field">Room
+                <select className="timetable-select" value={roomFilter} onChange={(event) => setRoomFilter(event.target.value)}>
+                  <option value="">All rooms</option>
+                  {rooms.map((room) => <option key={room.id} value={room.id}>{room.roomNumber} · {room.roomType}</option>)}
+                </select>
+              </label>
+            </div>
+          </div>
+
+          {failedQueries.length ? (
+            <div className="timetable-state timetable-state--error">
+              <span>Some timetable data could not be loaded. Retry to refresh the calendar, rooms, and history.</span>
+              <button type="button" onClick={retryQueries}>Retry</button>
+            </div>
+          ) : null}
+
+          <section className="timetable-board-card" aria-label="Calendar">
+            <div className="timetable-board-head">
+              <div>
+                <h2>{view === "week" ? "Week calendar" : "Day calendar"}</h2>
+                <p>{canWrite ? "Select an open slot to schedule a duty." : "Read-only view."}</p>
+              </div>
+              <div className="timetable-board-meta">
+                <span>{rangeLabel(range.from, range.through)}</span>
+                <span>06:00–22:00 · {timeZone}</span>
+              </div>
+            </div>
+
+            {occurrencesQuery.isPending ? <div className="timetable-state">Loading timetable…</div> : null}
+            {occurrencesQuery.isError ? (
+              <div className="timetable-state timetable-state--error">
+                <span>{occurrencesQuery.error instanceof Error ? occurrencesQuery.error.message : "The timetable could not be loaded."}</span>
+                <button type="button" onClick={() => void occurrencesQuery.refetch()}>Retry</button>
+              </div>
+            ) : null}
+            {!occurrencesQuery.isPending && !occurrencesQuery.isError && occurrences.length === 0 ? (
+              <div className="timetable-state">No duties in this range. {canWrite ? "Choose an open slot to schedule the first one." : "Try another date range."}</div>
+            ) : null}
+
+            {!occurrencesQuery.isPending && !occurrencesQuery.isError ? (
+              <div className={`timetable-grid ${view === "week" ? "timetable-grid--week" : "timetable-grid--day"}`} style={gridStyle}>
+                <div className="timetable-corner" style={{ gridColumn: 1, gridRow: 1 }}>Time</div>
+                {range.dates.map((date, index) => {
+                  const meta = dateMeta(date);
+                  return (
+                    <div className="timetable-day-head" key={date} style={{ gridColumn: index + 2, gridRow: 1 }}>
+                      <b>{meta.weekday}</b>
+                      <span>{meta.month} {meta.day}</span>
+                    </div>
+                  );
+                })}
+                {Array.from({ length: END_HOUR - START_HOUR }, (_, hourIndex) => (
+                  <div className="timetable-hour-label" key={hourIndex} style={{ gridColumn: 1, gridRow: hourIndex + 2 }}>
+                    {minuteLabel(START_MINUTE + hourIndex * 60)}
+                  </div>
+                ))}
+                {range.dates.map((date, columnIndex) => {
+                  const pastDay = isPastDate(date, today);
+                  const dayEvents = eventsByDate.get(date) ?? [];
+                  return (
+                    <div
+                      className="timetable-day-column"
+                      key={date}
+                      style={{ gridColumn: columnIndex + 2, gridRow: `2 / span ${SLOT_COUNT}`, pointerEvents: "none" }}
+                    >
+                        {Array.from({ length: SLOT_COUNT }, (_, slotIndex) => {
+                          const slotStart = START_MINUTE + slotIndex * SLOT_MINUTES;
+                          const slotEnd = slotStart + SLOT_MINUTES;
+                          const slotOccurrence = occurrenceAt(date, slotStart);
+                          const label = `${readableDate(date)}, ${minuteLabel(slotStart)} to ${minuteLabel(slotEnd)}${slotOccurrence ? " · scheduled" : ""}`;
+                          return (
+                            <button
+                              type="button"
+                              className={`timetable-slot ${slotOccurrence ? "timetable-slot--scheduled" : ""} ${!slotOccurrence && (pastDay || !canWrite) ? "timetable-slot--inert" : ""}`}
+                              key={slotIndex}
+                              style={{ top: slotIndex * SLOT_PITCH_PX, height: SLOT_HEIGHT_PX, pointerEvents: "auto" }}
+                              aria-label={label}
+                              title={label}
+                              disabled={!slotOccurrence && (pastDay || !canWrite)}
+                              onClick={() => handleCellClick(date, slotStart)}
+                            />
+                          );
+                        })}
+                      {dayEvents.map((occurrence) => {
+                        const startMinute = occurrenceMinute(occurrence.startsAt, timeZone) ?? START_MINUTE;
+                        const rawEndMinute = occurrenceMinute(occurrence.endsAt, timeZone) ?? startMinute + SLOT_MINUTES;
+                        const endMinute = rawEndMinute > startMinute ? rawEndMinute : END_MINUTE;
+                        const startSlot = Math.max(0, Math.min(SLOT_COUNT - 1, Math.floor((startMinute - START_MINUTE) / SLOT_MINUTES)));
+                        const endSlot = Math.max(startSlot + 1, Math.min(SLOT_COUNT, Math.ceil((endMinute - START_MINUTE) / SLOT_MINUTES)));
+                        const past = occurrenceIsPast(occurrence, timeZone, clock);
+                        const conflicts = occurrence.conflicts ?? [];
+                        const blocking = conflicts.some((conflict) => conflict.level === "BLOCKING");
+                        const notes = [
+                          statusText(occurrence.status),
+                          past ? "Past" : "",
+                          blocking ? "Blocking conflict" : conflicts.length ? `${conflicts.length} conflict${conflicts.length === 1 ? "" : "s"}` : "",
+                          rawEndMinute <= startMinute ? "Ends after midnight" : "",
+                        ].filter(Boolean).join(" · ");
+                        const eventClasses = [
+                          "timetable-event",
+                          panel.kind !== "none" && "occurrenceId" in panel && panel.occurrenceId === occurrence.id ? "timetable-event--selected" : "",
+                          occurrence.status === "CANCELLED" ? "timetable-event--cancelled" : "",
+                          past ? "timetable-event--past" : "",
+                          blocking ? "timetable-event--blocked" : "",
+                        ].filter(Boolean).join(" ");
+                        return (
+                          <button
+                            type="button"
+                            className={eventClasses}
+                            key={occurrence.id}
+                            style={{ top: startSlot * SLOT_PITCH_PX, height: (endSlot - startSlot) * SLOT_PITCH_PX - 1, pointerEvents: "auto", zIndex: 2 }}
+                            onClick={() => openOccurrence(occurrence)}
+                            aria-label={`${doctorLabel(occurrence, doctorsById)}, ${roomDescription(occurrence, roomsById)}, ${minuteLabel(startMinute)} to ${minuteLabel(endMinute)}, ${notes}`}
+                          >
+                            <span className="timetable-event-time">{minuteLabel(startMinute)}–{minuteLabel(endMinute)}</span>
+                            <b className="timetable-event-doctor">{doctorLabel(occurrence, doctorsById)}</b>
+                            <span className="timetable-event-room">{roomDescription(occurrence, roomsById)}</span>
+                            <span className="timetable-event-status">{notes}</span>
+                            {conflicts.length ? <span className="timetable-event-status">Conflicts: {conflictSummary(conflicts)}</span> : null}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  );
+                })}
+              </div>
+            ) : null}
+          </section>
+
+          <section className="timetable-agenda" aria-label="Agenda">
+            <div className="timetable-agenda-head"><h2>Agenda</h2><span>{occurrences.length} visible entr{occurrences.length === 1 ? "y" : "ies"}</span></div>
+            {occurrences.length ? occurrences.map((occurrence) => {
+              const startMinute = occurrenceMinute(occurrence.startsAt, timeZone);
+              const endMinute = occurrenceMinute(occurrence.endsAt, timeZone);
+              const notes = [
+                statusText(occurrence.status),
+                occurrenceIsPast(occurrence, timeZone, clock) ? "Past" : "",
+                occurrence.conflicts?.length ? `Conflicts: ${conflictSummary(occurrence.conflicts)}` : "",
+              ].filter(Boolean).join(" · ");
+              return (
+                <article className="timetable-agenda-item" key={occurrence.id}>
+                  <div className="timetable-agenda-time">{readableDate(occurrence.occurrenceDate)}<br />{startMinute === null ? "—" : minuteLabel(startMinute)}–{endMinute === null ? "—" : minuteLabel(endMinute)}</div>
+                  <div className="timetable-agenda-main">
+                    <b>{doctorLabel(occurrence, doctorsById)}</b>
+                    <span>{roomDescription(occurrence, roomsById)} · {notes}</span>
+                  </div>
+                </article>
+              );
+            }) : <div className="timetable-state">No duties to show in this range.</div>}
+          </section>
+
+          {renderEditor()}
+
+          <section className="timetable-activity" aria-label="Activity history">
+            <div className="timetable-board-head"><div><h2>Activity</h2><p>Recent timetable changes for this department.</p></div></div>
+            {activityQuery.isPending ? <div className="timetable-state">Loading activity…</div> : null}
+            {activityQuery.isError ? (
+              <div className="timetable-state timetable-state--error">
+                <span>{activityQuery.error instanceof Error ? activityQuery.error.message : "Activity could not be loaded."}</span>
+                <button type="button" onClick={() => void activityQuery.refetch()}>Retry</button>
+              </div>
+            ) : null}
+            {!activityQuery.isPending && !activityQuery.isError && !activity.length ? <div className="timetable-state">No activity has been recorded yet.</div> : null}
+            <div className="timetable-activity-list">
+              {activity.map((event: ActivityEvent) => (
+                <article className="timetable-activity-item" key={event.id}>
+                  <div className="timetable-activity-main">
+                    <b>{actionText(event.action)}</b>
+                    <span>{formatActivityTime(event.createdAt, timeZone)}</span>
+                    <span>{metadataSummary(event.metadata)}</span>
+                  </div>
+                </article>
+              ))}
+            </div>
+          </section>
+        </>
+      ) : null}
+    </div>
+  );
 }
